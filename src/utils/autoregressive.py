@@ -11,6 +11,7 @@ from models.fno.fno2d import Fno2d
 from models.auto_ffn import AutoFfn
 from models.latent_diffusion import LatentDiffusionCfdModel
 from models.ldm2 import LatentDiffusionCfdModel2
+from models.pixel_diffusion import PixelDiffusionCfdModel
 from models.loss import loss_name_to_fn
 from args import Args
 
@@ -57,7 +58,7 @@ def init_model(args: Args) -> AutoCfdModel:
     elif args.model == "auto_deeponet":
         branch_dim = n_cols * n_rows + n_case_params
         model = AutoDeepONet(
-            branch_dim=branch_dim,  # +2 因为物性
+            branch_dim=branch_dim, 
             trunk_dim=2,  # (x, y)
             loss_fn=loss_fn,
             width=args.deeponet_width,
@@ -125,7 +126,7 @@ def init_model(args: Args) -> AutoCfdModel:
     elif args.model == "latent_diffusion":
         model = LatentDiffusionCfdModel(
             in_chan=args.in_chan,
-            out_chan=args.out_ch,
+            out_chan=args.out_chan,
             n_case_params=n_case_params,
             vae_weights_path=args.ldm_vae_weights_path,
             noise_scheduler_timesteps=args.ldm_noise_scheduler_timesteps,
@@ -158,6 +159,17 @@ def init_model(args: Args) -> AutoCfdModel:
             unet_num_res_blocks=unet_num_res_blocks,
             unet_attention_resolutions=unet_attention_resolutions,
         )
+        return model
+    elif args.model == "pixel_diffusion":
+        model = PixelDiffusionCfdModel(
+            in_chan=args.in_chan,
+            out_chan=args.out_chan,
+            loss_fn=loss_fn,
+            n_case_params=n_case_params,
+            image_size=64,
+            noise_scheduler_timesteps=args.ldm_noise_scheduler_timesteps,
+            use_gradient_checkpointing=args.use_gradient_checkpointing,
+        ).cuda()
         return model
     else:
         raise ValueError(f"Invalid model name: {args.model}")

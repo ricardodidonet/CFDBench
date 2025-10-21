@@ -16,7 +16,7 @@ class Args(Tap):
 
     num_epochs: int = 10  # Number of epochs to train for
 
-    eval_interval: int = 10
+    eval_interval: int = 5
     """Evaluate every eval_interval epochs, and save checkpoint."""
 
     log_interval: int = 50  # Log training progress every log_interval batches
@@ -40,7 +40,7 @@ class Args(Tap):
     out_chan: int = 2
     """Number of output channels, only applicable to autoregressive models"""
 
-    batch_size: int = 1
+    batch_size: int = 8
     eval_batch_size: int = 2
 
      # --- Added Mixed Precision Flag ---
@@ -72,7 +72,7 @@ class Args(Tap):
     num_cols = 64
     """Number of columns in the lattice that represents the field."""
 
-    delta_time: float = 0.2
+    delta_time: float = 0.1
     """The time step size."""
 
     # FFN hyperparameters
@@ -146,7 +146,13 @@ class Args(Tap):
     # --- Hardcoded the pre-calculated scaling factor ---
     ldm_scaling_factor: float = 4.5578
     """The scaling factor for the VAE latent space."""
-    
+
+    use_gradient_checkpointing: bool = True
+    """Enable gradient checkpointing for diffusion models to save VRAM (slower training)."""
+
+    gradient_accumulation_steps: int = 1
+    """Number of gradient accumulation steps. Effective batch size = batch_size * gradient_accumulation_steps."""
+
     vae_kl_weight: float = 1e-4
     """The weight of the KL Divergence loss for VAE training."""
     
