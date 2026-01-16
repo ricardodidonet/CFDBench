@@ -216,89 +216,7 @@ class Args(Tap):
     resnet_padding: int = 3
     """Padding for ResNet convolutions"""
 
-    # --- VAE (Variational Autoencoder) ---
-    vae_kl_weight: float = 1e-4
-    """Weight for KL divergence loss in VAE"""
-
-    vae_kl_annealing_epochs: int = 20
-    """Epochs to linearly anneal KL weight from 0 to final value"""
-
-    # VAE Architecture (AutoencoderKL ddconfig)
-    double_z: bool = True
-    """Use double z channels in VAE"""
-
-    z_channels: int = 4
-    """Number of latent channels in VAE"""
-
-    resolution: int = 64
-    """Input resolution for VAE"""
-
-    in_channels: int = 2
-    """Input channels for VAE (use in_chan instead when possible)"""
-
-    out_ch: int = 2
-    """Output channels for VAE (use out_chan instead when possible)"""
-
-    ch: int = 64
-    """Base channel count for VAE"""
-
-    ch_mult: List[int] = [1, 2, 3, 4]
-    """Channel multipliers for VAE encoder/decoder stages"""
-
-    num_res_blocks: int = 2
-    """Number of residual blocks per VAE stage"""
-
-    attn_resolutions: List[int] = [16, 8]
-    """Resolutions at which to apply attention in VAE"""
-
-    dropout: float = 0.0
-    """Dropout rate for VAE"""
-
-    has_mid_attn: bool = True
-    """Use attention in VAE middle block"""
-
-    embed_dim: int = 4
-    """Embedding dimension for VAE latent space"""
-
-    # VAE Loss Configuration
-    disc_start: int = 50001
-    """Training step to start discriminator"""
-
-    kl_weight: float = 0.000001
-    """KL divergence weight for VAE loss"""
-
-    disc_weight: float = 0.5
-    """Discriminator loss weight"""
-
-    # --- Latent Diffusion Model (LDM) ---
-    project_root = Path(__file__).parent.parent
-    default_vae_path = project_root / "weights" / "vaelite_002.pt"
-
-    ldm_vae_weights_path: str = str(default_vae_path)
-    """Path to pre-trained VAE weights for latent diffusion"""
-
-    ldm_latent_dim: int = 4
-    """Number of channels in latent space"""
-
-    ldm_noise_scheduler_timesteps: int = 1000
-    """Number of diffusion timesteps"""
-
-    ldm_scaling_factor: float = 4.5578
-    """Scaling factor for VAE latent space (pre-calculated)"""
-
-    # U-Net for LDM2
-    unet_base_channels: int = 64
-    """Base channel count for LDM2 U-Net"""
-
-    unet_channel_mult = (1, 2, 4)
-    """Channel multipliers for LDM2 U-Net stages"""
-
-    unet_num_res_blocks: int = 1
-    """Number of residual blocks per LDM2 U-Net stage"""
-
-    unet_attention_resolutions = ()
-    """Resolutions for attention in LDM2 U-Net"""
-
+  
     # --- Pixel Diffusion (PUNetG) ---
     pixel_diffusion_base_channels: int = 64
     """Base channel count for Pixel Diffusion PUNetG model"""
@@ -339,35 +257,6 @@ class Args(Tap):
     # ============================================================================
     # HELPER METHODS
     # ============================================================================
-
-    def get_ddconfig(self):
-        """Creates a ddconfig object for AutoencoderKL from arguments."""
-        from diffsci.models.nets.autoencoderldm2d import ddconfig
-
-        return ddconfig(
-            double_z=self.double_z,
-            z_channels=self.z_channels,
-            resolution=self.resolution,
-            in_channels=self.in_channels,
-            out_ch=self.out_ch,
-            ch=self.ch,
-            ch_mult=self.ch_mult,
-            num_res_blocks=self.num_res_blocks,
-            attn_resolutions=self.attn_resolutions,
-            dropout=self.dropout,
-            has_mid_attn=self.has_mid_attn
-        )
-
-    def get_lossconfig(self):
-        """Creates a lossconfig object for AutoencoderKL from arguments."""
-        from diffsci.models.nets.autoencoderldm2d import lossconfig
-
-        return lossconfig(
-            disc_start=self.disc_start,
-            kl_weight=self.kl_weight,
-            disc_weight=self.disc_weight,
-        )
-
 
 def is_args_valid(args: Args):
     """Validate argument values."""
