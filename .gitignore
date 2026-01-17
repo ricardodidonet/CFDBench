@@ -7,3 +7,33 @@ weights/
 *.png
 wget-log
 cfdbench/
+
+# PyTorch model files
+*.pt
+*.pth
+*.ckpt
+
+# Jupyter Notebook files
+*.ipynb
+.ipynb_checkpoints/
+
+# Large data files
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.npy
+*.npz
+
+# Compressed archives
+*.tar
+*.tar.gz
+*.zip
+*.7z
+
+# Large media files (if relevant)
+*.mp4
+*.avi
+*.mov
+*.wav
+*.mp3
