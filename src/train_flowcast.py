@@ -3,19 +3,13 @@
 import logging
 import sys, os
 from pathlib import Path
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 import time
 import json
 import datetime
 
+import torch
+from torch.utils.data import DataLoader
 
-# Flow matching imports
-from flow_matching.solver import ODESolver
-
-# Local imports
 from dataset import get_auto_dataset
 from training.train_loop import train_epoch
 from training.eval_loop import eval_model
@@ -26,59 +20,6 @@ from models.fluid_unet import FluidDynamicsUNet
 from args import Args
 
 logger = logging.getLogger(__name__)
-
-
-
-
-@torch.no_grad()
-def sample_prediction(model, x_prev_1, x_prev_2, case_params, device, num_steps=50):
-    """
-    Generate a prediction by sampling from the learned flow.
-
-    This uses the ODE solver to integrate the learned velocity field
-    from noise (t=0) to data (t=1).
-
-    Args:
-        model: Trained model
-        x_prev_1: Previous state at t-1, shape (B, 2, H, W)
-        x_prev_2: Previous state at t-2, shape (B, 2, H, W)
-        case_params: Case parameters, shape (B, D)
-        device: Device
-        num_steps: Number of ODE integration steps
-
-    Returns:
-        Predicted next state, shape (B, 2, H, W)
-    """
-    model.eval()
-
-    # Create a wrapper for the model that has the right signature for ODESolver
-    class ModelWrapper(nn.Module):
-        def __init__(self, model, x_prev_1, x_prev_2, case_params):
-            super().__init__()
-            self.model = model
-            self.x_prev_1 = x_prev_1
-            self.x_prev_2 = x_prev_2
-            self.case_params = case_params
-
-        def forward(self, t, x):
-            # t is a scalar, we need to broadcast to batch size
-            batch_size = x.shape[0]
-            if t.dim() == 0:
-                t = t.repeat(batch_size)
-            return self.model(x, t, self.x_prev_1, self.x_prev_2, self.case_params)
-
-    wrapped_model = ModelWrapper(model, x_prev_1, x_prev_2, case_params)
-
-    # Create ODE solver
-    solver = ODESolver(wrapped_model)
-
-    # Start from Gaussian noise
-    x_0 = torch.randn_like(x_prev_1)
-
-    # Solve ODE from t=0 to t=1
-    x_1 = solver.sample(x_0, step_size=1.0 / num_steps)
-
-    return x_1
 
 
 def main():
@@ -99,10 +40,10 @@ def main():
 
     # Load or create data
     if args.data_path is not None:
-        logger.info(f"Loading data from {args.data_path}")
+        logger.info(f"Loading data from {args.data_dir}")
     
     # Create base datasets
-    base_dataset_train, base_dataset_val, base_dataset_test = get_auto_dataset(
+    base_dataset_train, base_dataset_val = get_auto_dataset(
     data_dir=args.data_dir,
     data_name='cylinder_geo',
     delta_time=0.1,
@@ -114,18 +55,22 @@ def main():
     dataset_train = FlowCastWrapperDataset(base_dataset_train)
     logger.info(dataset_train)
 
+    dataset_val = FlowCastWrapperDataset(base_dataset_val)
+    logger.info(dataset_val)
+
+
     # Create data loaders
     logger.info("Intializing DataLoader")
     train_loader = DataLoader(
-        dataset_train,
+        dataset=dataset_train,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=True,                                                                 
     )
 
     val_loader = DataLoader(
-        base_dataset_val,
+        dataset=dataset_val,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -241,7 +186,6 @@ def main():
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info(f"Training time {total_time_str}")
-
 
 
 if __name__ == "__main__":

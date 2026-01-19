@@ -22,11 +22,16 @@ class Args(Tap):
     mode: str = "train"
     """Mode: 'train' or 'test'"""
 
+    eval_only: bool = False
+    """No training. Only run evaluation."""
+
     seed: int = 0
     """Random seed for reproducibility"""
 
     output_dir: str = "result"
     """Directory to save results, checkpoints, and logs"""
+
+    save_dir: str = ""
 
 
     # ============================================================================
@@ -40,7 +45,12 @@ class Args(Tap):
     weight_decay: float = 1e-5
     """Weight decay for optimizer (L2 regularization)"""
 
-    num_epochs: int = 100
+    dropout: float = 0.1
+
+    start_epoch: int = 0
+    """epoch to start training"""
+
+    epochs: int = 100
     """Number of training epochs"""
 
     batch_size: int = 8
@@ -48,6 +58,13 @@ class Args(Tap):
 
     eval_batch_size: int = 16
     """Evaluation batch size (can be different from training)"""
+
+    test_run: bool = False
+    """only run one batch of training and evaluation."""
+
+    device: str = 'cuda'
+
+    num_workers: int = 4
 
     # --- Learning Rate Scheduling ---
     lr_scheduler_factor: float = 0.5
@@ -64,7 +81,7 @@ class Args(Tap):
     log_interval: int = 50
     """Log training metrics every N batches"""
 
-    eval_interval: int = 2
+    eval_frequency: int = 2
     """Evaluate model every N epochs"""
 
     save_checkpoint_every_n_epochs: int = 20
@@ -230,6 +247,17 @@ class Args(Tap):
     pixel_diffusion_dropout: float = 0.1
     """Dropout rate for PUNetG ResNet blocks"""
 
+    # --- Fluid UNET --- 
+    model_channels: int = 128
+
+    num_res_blocks: int = 2
+
+    num_case_params: int = 8
+
+    use_fourier_conditioning: bool = True
+
+    num_fourier_freqs: int = 16
+
 
     # ============================================================================
     # 6. ADVANCED TRAINING OPTIONS
@@ -238,7 +266,7 @@ class Args(Tap):
     use_mixed_precision: bool = True
     """Enable Automatic Mixed Precision (AMP) for faster training and lower memory"""
 
-    gradient_accumulation_steps: int = 1
+    accum_iter: int = 1
     """
     Accumulate gradients over N steps before updating weights.
     Effective batch size = batch_size × gradient_accumulation_steps
