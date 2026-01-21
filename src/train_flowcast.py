@@ -204,7 +204,12 @@ def main():
                     epoch=epoch,
                 )
            
-            num_ode_steps = 25 if not args.eval_only else 50
+            # Use more ODE steps and batches for better evaluation accuracy
+            # During training: 100 steps on 50 batches (~1600 samples)
+            # During eval_only: 100 steps on all batches (full validation set)
+            num_ode_steps = 100  # Increased from 25/50 for better ODE integration
+            max_batches = None if args.eval_only else 50  # Increased from 10 to reduce variance
+
             eval_stats = eval_model(
                 model=model,
                 data_loader=val_loader,
@@ -212,7 +217,7 @@ def main():
                 epoch=epoch,
                 num_ode_steps=num_ode_steps,
                 output_dir=args.output_dir,
-                max_batches=10
+                max_batches=max_batches
             )
             log_stats.update({f"{k}": v for k, v in eval_stats.items()})
 
