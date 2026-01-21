@@ -76,12 +76,18 @@ def main():
     norm_bc=True,
     load_splits=['train', 'dev']
 )
-    # wrapped dataset for flowcast
-    dataset_train = FlowCastWrapperDataset(base_dataset_train)
-    logger.info(dataset_train)
+    # Wrapped dataset for flowcast
+    # IMPORTANT: Compute normalization stats on training set only
+    logger.info("Creating training dataset wrapper...")
+    dataset_train = FlowCastWrapperDataset(base_dataset_train, normalize=True)
+    logger.info(f"Training dataset: {len(dataset_train)} samples")
 
-    dataset_val = FlowCastWrapperDataset(base_dataset_val)
-    logger.info(dataset_val)
+    # Get normalization stats from training set and apply to validation
+    # This prevents data leakage!
+    norm_stats = dataset_train.get_norm_stats()
+    logger.info("Creating validation dataset wrapper with training normalization stats...")
+    dataset_val = FlowCastWrapperDataset(base_dataset_val, normalize=True, norm_stats=norm_stats)
+    logger.info(f"Validation dataset: {len(dataset_val)} samples")
 
 
     # Create data loaders
