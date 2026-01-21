@@ -31,8 +31,6 @@ class Args(Tap):
     output_dir: str = "result"
     """Directory to save results, checkpoints, and logs"""
 
-    save_dir: str = ""
-
 
     # ============================================================================
     # 2. TRAINING CONFIGURATION
@@ -42,22 +40,28 @@ class Args(Tap):
     lr: float = 1e-4
     """Initial learning rate"""
 
+    decay_lr: bool = False
+    """whether to use learning rate decay"""
+
     weight_decay: float = 1e-5
     """Weight decay for optimizer (L2 regularization)"""
 
     dropout: float = 0.1
 
-    start_epoch: int = 0
+    start_epoch: int = 14
     """epoch to start training"""
 
     epochs: int = 100
     """Number of training epochs"""
 
-    batch_size: int = 8
+    batch_size: int = 16
     """Training batch size"""
 
     eval_batch_size: int = 16
     """Evaluation batch size (can be different from training)"""
+
+    eval_crps: bool = False
+    """whether to run CRPS metric during evaluation"""
 
     test_run: bool = False
     """only run one batch of training and evaluation."""
@@ -81,7 +85,7 @@ class Args(Tap):
     log_interval: int = 50
     """Log training metrics every N batches"""
 
-    eval_frequency: int = 2
+    eval_frequency: int = 5
     """Evaluate model every N epochs"""
 
     save_checkpoint_every_n_epochs: int = 20
@@ -96,6 +100,16 @@ class Args(Tap):
 
     early_stopping_delta: float = 1e-5
     """Minimum validation loss change to count as improvement"""
+
+    resume: str = "result/checkpoint.pth"
+    """path str to checkpoint"""
+
+    # ---  Flow Matching ----
+    use_skewed_timesteps: bool = False
+    """whether to use skewed timesteps when sampling time"""
+
+    conditioning_drop_prob: float = 0.1
+    """Probability of dropping conditioning signal (CFG)"""
 
 
     # ============================================================================
