@@ -40,21 +40,21 @@ class Args(Tap):
     lr: float = 1e-4
     """Initial learning rate"""
 
-    decay_lr: bool = False
+    decay_lr: bool = True
     """whether to use learning rate decay"""
 
-    weight_decay: float = 1e-5
+    weight_decay: float = 0.01
     """Weight decay for optimizer (L2 regularization)"""
 
-    dropout: float = 0.1
+    dropout: float = 0.2
 
-    start_epoch: int = 14
+    start_epoch: int = 0
     """epoch to start training"""
 
     epochs: int = 100
     """Number of training epochs"""
 
-    batch_size: int = 16
+    batch_size: int = 32
     """Training batch size"""
 
     eval_batch_size: int = 16
@@ -108,7 +108,7 @@ class Args(Tap):
     use_skewed_timesteps: bool = False
     """whether to use skewed timesteps when sampling time"""
 
-    conditioning_drop_prob: float = 0.1
+    conditioning_drop_prob: float = 0.15
     """Probability of dropping conditioning signal (CFG)"""
 
 
