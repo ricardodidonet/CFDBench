@@ -54,9 +54,8 @@ def train_epoch(
 
     accum_iter = args.accum_iter
     path = CondOTProbPath()
-    prog_bar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
-    for data_iter_step, batch in enumerate(prog_bar):
+    for data_iter_step, batch in enumerate(dataloader):
         if data_iter_step % accum_iter == 0:
             optimizer.zero_grad()
             batch_loss.reset()
@@ -101,7 +100,7 @@ def train_epoch(
             }
 
         # Flow matching loss with AMP
-        with torch.amp.autocast():
+        with torch.amp.autocast(device_type=device.type):
             predicted_velocity = model(x_t, t, extra)
             loss = torch.nn.functional.mse_loss(predicted_velocity, u_t)
 

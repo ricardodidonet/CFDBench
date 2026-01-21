@@ -1,6 +1,9 @@
 import torch
 from torch.utils.data import Dataset
 from typing import Dict, Tuple
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Assuming your CFDBench dataset classes are importable
 # from dataset.base import CfdAutoDataset # Or the specific class like CavityFlowAutoDataset
@@ -12,13 +15,19 @@ class FlowCastWrapperDataset(Dataset):
 
     It assumes the base dataset provides (X_{t-1}, X_t, case_params).
     """
-    def __init__(self, base_dataset):
+    def __init__(self, base_dataset, normalize=True):
         """
         Args:
             base_dataset: An instance of a CfdAutoDataset subclass
                           (e.g., CavityFlowAutoDataset).
+            normalize: whether to normalize the data.
         """
         self.base_dataset = base_dataset
+        self.normalize = normalize
+
+        if self.normalize:
+            # compute per-channel mean and std:
+            self.compute_normalization_stats()
         
         # We need access to the original sequential data if possible,
         # but the base dataset pre-pairs t-1 and t.
@@ -27,7 +36,8 @@ class FlowCastWrapperDataset(Dataset):
 
         # Pre-calculate valid indices to avoid crossing case boundaries.
         self.valid_indices = []
-        print("Pre-calculating valid indices for GenCastWrapperDataset...")
+        logger.info("Pre-calculating valid indices for FlowCastWrapperDataset...")
+
         for i in range(len(self.base_dataset)):
             # Get case ID for current index (i corresponds to t-1)
             # and previous index (i-1 corresponds to t-2)
@@ -38,7 +48,24 @@ class FlowCastWrapperDataset(Dataset):
                 if current_case_id == previous_case_id:
                     self.valid_indices.append(i)
             # The very first sample (i=0) is never valid because it has no t-2
-        print(f"Wrapper dataset contains {len(self.valid_indices)} valid (t-2, t-1, t) samples.")
+        logger.info(f"Wrapper dataset contains {len(self.valid_indices)} valid (t-2, t-1, t) samples.")
+
+    def compute_normalization_stats(self):
+        """Compute mean/std for u and v channels."""
+        all_u, all_v = [], []
+        for i in range(len(self.base_dataset)):
+            x, _, _ = self.base_dataset[i]
+            all_u.append(x[0])  # u channel
+            all_v.append(x[1])  # v channel
+        
+        all_u = torch.stack(all_u)
+        all_v = torch.stack(all_v)
+        
+        self.u_mean, self.u_std = all_u.mean(), all_u.std()
+        self.v_mean, self.v_std = all_v.mean(), all_v.std()
+        
+        logger.info(f"Normalization stats - u: mean={self.u_mean:.4f}, std={self.u_std:.4f}")
+        logger.info(f"Normalization stats - v: mean={self.v_mean:.4f}, std={self.v_std:.4f}")
 
 
     def __len__(self) -> int:
@@ -48,9 +75,9 @@ class FlowCastWrapperDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         """
         Returns a dictionary containing:
-        - 'inputs_prev': X_{t-2} tensor [C, H, W] (including mask channel)
-        - 'inputs':      X_{t-1} tensor [C, H, W] (including mask channel)
-        - 'label':       X_{t}   tensor [C, H, W] (including mask channel)
+        - 'x_prev_2':   X_{t-2} tensor [C, H, W] (including mask channel)
+        - 'x_prev_1':   X_{t-1} tensor [C, H, W] (including mask channel)
+        - 'x_target':   X_{t}   tensor [C, H, W] (including mask channel)
         - 'case_params': Dictionary of case parameters for this sample.
                          (Will be converted to tensor in collate_fn)
         """
@@ -59,20 +86,31 @@ class FlowCastWrapperDataset(Dataset):
         base_dataset_index = self.valid_indices[index]
 
         # Get the (X_{t-1}, X_t, case_params) tuple for the *current* step
-        inputs_t_minus_1, label_t, case_params_t = self.base_dataset[base_dataset_index]
+        x_prev_1, x_target, case_params = self.base_dataset[base_dataset_index]
 
         # Get the (X_{t-2}, X_{t-1}, case_params) tuple for the *previous* step
         # We know base_dataset_index > 0 and it's within the same case
         # because of how we constructed valid_indices.
-        inputs_t_minus_2, _, _ = self.base_dataset[base_dataset_index - 1]
+        x_prev_2,  _,  _ = self.base_dataset[base_dataset_index - 1]
         
-        # Note: inputs_t_minus_1 and the label from the previous step should be identical.
+        # Note: x_prev_1 and the label from the previous step should be identical.
         # We assume case_params are consistent for consecutive steps within a case.
 
+        if self.normalize:
+            # normalize velocity channels:  
+            x_prev_2[0] = (x_prev_2[0] - self.u_mean) / self.u_std
+            x_prev_2[1] = (x_prev_2[1] - self.v_mean) / self.v_std
+
+            x_prev_1[0] = (x_prev_1[0] - self.u_mean) / self.u_std
+            x_prev_1[1] = (x_prev_1[1] - self.v_mean) / self.v_std
+
+            x_target[0] = (x_target[0] - self.u_mean) / self.u_std
+            x_target[1] = (x_target[1] - self.v_mean) / self.v_std
+
         return {
-            'inputs_prev': inputs_t_minus_2,  # This is X_{t-2}
-            'inputs':      inputs_t_minus_1,  # This is X_{t-1}
-            'label':       label_t,           # This is X_{t}
-            'case_params': case_params_t      # Pass the dict, collate handles tensor conversion
+            'x_prev_2':     x_prev_2,         # This is X_{t-2}
+            'x_prev_1':     x_prev_1,         # This is X_{t-1}
+            'x_target':     x_target,         # This is X_{t}
+            'case_params':  case_params       # Pass the dict, collate handles tensor conversion
         }
 

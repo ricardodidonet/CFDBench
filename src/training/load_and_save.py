@@ -1,6 +1,9 @@
 from pathlib import Path
 import torch
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 def save_model(args, model, optimizer, lr_schedule, loss_scaler, epoch):
     """Save model checkpoint (single-process version)."""
@@ -34,10 +37,10 @@ def load_model(args, model, optimizer, lr_schedule, loss_scaler):
         return
     
     if not os.path.exists(args.resume):
-        print(f"Warning: {args.resume} not found. Starting fresh.")
+        logger.warning(f"{args.resume} not found. Starting fresh.")
         return
     
-    print(f"Loading checkpoint from {args.resume}")
+    logger.info(f"Loading checkpoint from {args.resume}")
     checkpoint = torch.load(args.resume, map_location="cpu")
     
     model.load_state_dict(checkpoint["model"])
@@ -50,4 +53,4 @@ def load_model(args, model, optimizer, lr_schedule, loss_scaler):
         if "scaler" in checkpoint and loss_scaler is not None:
             loss_scaler.load_state_dict(checkpoint["scaler"])
         
-        print(f"Resuming from epoch {args.start_epoch}")
+        logger.info(f"Resuming from epoch {args.start_epoch}")
