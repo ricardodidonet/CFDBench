@@ -240,7 +240,7 @@ def single_step_prediction(
     case_params: Optional[torch.Tensor],
     device: torch.device,
     cfg_scale: float = 0.0,
-    num_steps: int = 50,
+    num_steps: int = 100,
 ) -> torch.Tensor:
     """
     Generate single-step prediction using ODE solver.
