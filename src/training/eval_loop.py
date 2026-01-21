@@ -15,6 +15,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import numpy as np
+from torchmetrics.regression import ContinuousRankedProbabilityScore
+from torchmetrics.aggregation import MeanMetric
+from tqdm import tqdm
+import torch.nn.functional as F
 
 from flow_matching.solver import ODESolver
 from flow_matching.utils import ModelWrapper
@@ -25,6 +29,7 @@ PRINT_FREQUENCY = 10
 
 
 class CFGScaledFluidModel(ModelWrapper):
+
     """
     Model wrapper for classifier-free guidance on case parameters.
 
@@ -105,44 +110,124 @@ class CFGScaledFluidModel(ModelWrapper):
     def get_nfe(self) -> int:
         """Get number of function evaluations."""
         return self.nfe_counter
-
-
-def compute_physical_metrics(predicted: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
+    
+def compute_spatial_metrics(
+    predicted: torch.Tensor, 
+    target: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    use_absolute_error: bool = True
+) -> Dict[str, np.ndarray]:
     """
-    Compute physical metrics for fluid dynamics.
+    Compute spatial (per-pixel) error maps for visualization.
+    
+    Args:
+        predicted: Predicted velocity fields (B, 2, H, W)
+        target: Ground truth velocity fields (B, 2, H, W)
+        mask: Optional mask (B, 1, H, W) where 1=valid, 0=boundary
+        use_absolute_error: If True, compute absolute error; if False, compute squared error
+        
+    Returns:
+        Dictionary with spatial error maps (B, H, W) as numpy arrays
+    """
+    if use_absolute_error:
+        # Absolute errors (better for visualization)
+        u_error = torch.abs(predicted[:, 0] - target[:, 0])  # (B, H, W)
+        v_error = torch.abs(predicted[:, 1] - target[:, 1])  # (B, H, W)
+    else:
+        # Squared errors (MSE)
+        u_error = (predicted[:, 0] - target[:, 0]) ** 2  # (B, H, W)
+        v_error = (predicted[:, 1] - target[:, 1]) ** 2  # (B, H, W)
+    
+    # Velocity magnitude error
+    pred_mag = torch.sqrt(predicted[:, 0]**2 + predicted[:, 1]**2)
+    target_mag = torch.sqrt(target[:, 0]**2 + target[:, 1]**2)
+    
+    if use_absolute_error:
+        magnitude_error = torch.abs(pred_mag - target_mag)  # (B, H, W)
+    else:
+        magnitude_error = (pred_mag - target_mag) ** 2  # (B, H, W)
+    
+    # Apply mask if provided (set masked regions to 0 or NaN)
+    if mask is not None:
+        mask_2d = mask.squeeze(1)  # (B, H, W)
+        
+        # Option 1: Set masked regions to 0
+        #_error = u_error * mask_2d
+        #v_error = v_error * mask_2d
+        #magnitude_error = magnitude_error * mask_2d
+        
+        # Option 2: Set masked regions to NaN for better visualization
+        #(matplotlib will show them as white/transparent)
+        u_error = torch.where(mask_2d == 1, u_error, torch.tensor(float('nan')))
+        v_error = torch.where(mask_2d == 1, v_error, torch.tensor(float('nan')))
+        magnitude_error = torch.where(mask_2d == 1, magnitude_error, torch.tensor(float('nan')))
+    
+    return {
+        'u_error': u_error.cpu().numpy(),  # (B, H, W)
+        'v_error': v_error.cpu().numpy(),  # (B, H, W)
+        'magnitude_error': magnitude_error.cpu().numpy(),  # (B, H, W)
+        'mask': mask.squeeze(1).cpu().numpy() if mask is not None else None,  # (B, H, W)
+    }
+
+    
+def compute_physical_metrics(
+    predicted: torch.Tensor, 
+    target: torch.Tensor,
+    mask: Optional[torch.Tensor] = None
+) -> Dict[str, float]:
+    """
+    Compute physical metrics for fluid dynamics with optional masking.
 
     Args:
         predicted: Predicted velocity fields (B, 2, H, W)
         target: Ground truth velocity fields (B, 2, H, W)
+        mask: Optional mask (B, 1, H, W) where 1=valid, 0=boundary
 
     Returns:
         Dictionary of metrics
     """
     metrics = {}
-
-    # Mean Squared Error
-    mse = torch.nn.functional.mse_loss(predicted, target)
-    metrics['mse'] = mse.item()
-
-    # Mean Absolute Error
-    mae = torch.nn.functional.l1_loss(predicted, target)
-    metrics['mae'] = mae.item()
-
-    # Relative error (L2 norm)
-    rel_error = torch.norm(predicted - target) / torch.norm(target)
-    metrics['relative_error'] = rel_error.item()
-
-    # Per-component errors
-    u_mse = torch.nn.functional.mse_loss(predicted[:, 0], target[:, 0])
-    v_mse = torch.nn.functional.mse_loss(predicted[:, 1], target[:, 1])
-    metrics['u_mse'] = u_mse.item()
-    metrics['v_mse'] = v_mse.item()
-
-    # Velocity magnitude error
-    pred_mag = torch.sqrt(predicted[:, 0]**2 + predicted[:, 1]**2)
-    target_mag = torch.sqrt(target[:, 0]**2 + target[:, 1]**2)
-    mag_mse = torch.nn.functional.mse_loss(pred_mag, target_mag)
-    metrics['magnitude_mse'] = mag_mse.item()
+    
+    if mask is not None:
+        # Expand mask to match prediction channels
+        mask_expanded = mask.expand_as(predicted)  # (B, 2, H, W)
+        valid_pixels = mask.sum()
+        
+        if valid_pixels == 0:
+            logger.warning("Mask has no valid pixels!")
+            valid_pixels = 1.0  # Avoid division by zero
+        
+        # Mean Squared Error (masked)
+        mse = ((predicted - target) ** 2 * mask_expanded).sum() / valid_pixels
+        metrics['mse'] = mse.item() 
+        
+        # Per-component errors (masked)
+        mask_u = mask.squeeze(1)  # (B, H, W)
+        u_mse = ((predicted[:, 0] - target[:, 0]) ** 2 * mask_u).sum() / mask.sum()
+        v_mse = ((predicted[:, 1] - target[:, 1]) ** 2 * mask_u).sum() / mask.sum()
+        metrics['u_mse'] = u_mse.item()
+        metrics['v_mse'] = v_mse.item()
+        
+        # Velocity magnitude error (masked)
+        pred_mag = torch.sqrt(predicted[:, 0]**2 + predicted[:, 1]**2)
+        target_mag = torch.sqrt(target[:, 0]**2 + target[:, 1]**2)
+        mag_mse = ((pred_mag - target_mag) ** 2 * mask_u).sum() / mask.sum()
+        metrics['magnitude_mse'] = mag_mse.item()
+        
+    else:
+        # No mask - compute over entire domain (original behavior)
+        mse = torch.nn.functional.mse_loss(predicted, target)
+        metrics['mse'] = mse.item()
+        
+        u_mse = torch.nn.functional.mse_loss(predicted[:, 0], target[:, 0])
+        v_mse = torch.nn.functional.mse_loss(predicted[:, 1], target[:, 1])
+        metrics['u_mse'] = u_mse.item()
+        metrics['v_mse'] = v_mse.item()
+        
+        pred_mag = torch.sqrt(predicted[:, 0]**2 + predicted[:, 1]**2)
+        target_mag = torch.sqrt(target[:, 0]**2 + target[:, 1]**2)
+        mag_mse = torch.nn.functional.mse_loss(pred_mag, target_mag)
+        metrics['magnitude_mse'] = mag_mse.item()
 
     return metrics
 
@@ -264,6 +349,7 @@ def visualize_prediction(
     predicted: torch.Tensor,
     target: torch.Tensor,
     save_path: Path,
+    mask: Optional[torch.Tensor] = None,
     sample_idx: int = 0,
 ):
     """
@@ -272,47 +358,86 @@ def visualize_prediction(
     Args:
         predicted: Predicted field (B, 2, H, W)
         target: Ground truth field (B, 2, H, W)
+        mask: Optional mask (B, 1, H, W) where 1=valid, 0=boundary
         save_path: Path to save figure
         sample_idx: Which sample in batch to visualize
     """
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 10))
 
-    # Convert to numpy
+    # Extract single sample and convert to numpy
     pred_u = predicted[sample_idx, 0].cpu().numpy()
     pred_v = predicted[sample_idx, 1].cpu().numpy()
     target_u = target[sample_idx, 0].cpu().numpy()
     target_v = target[sample_idx, 1].cpu().numpy()
 
-    # Compute magnitudes
+    # Compute magnitudes (numpy)
     pred_mag = np.sqrt(pred_u**2 + pred_v**2)
     target_mag = np.sqrt(target_u**2 + target_v**2)
+
+    # Compute absolute errors (numpy)
+    u_error = np.abs(pred_u - target_u)
+    v_error = np.abs(pred_v - target_v)
+    magnitude_error = np.abs(pred_mag - target_mag)
+
+    # Apply mask if provided
+    if mask is not None:
+        # Extract mask for this sample and squeeze to (H, W)
+        mask_2d = mask[sample_idx].squeeze().cpu().numpy()  # (H, W)
+        
+        # Option 2: Set masked regions to NaN for better visualization
+        # (matplotlib will show them as white/transparent)
+        u_error = np.where(mask_2d == 1, u_error, np.nan)
+        v_error = np.where(mask_2d == 1, v_error, np.nan)
+        magnitude_error = np.where(mask_2d == 1, magnitude_error, np.nan)
 
     # Plot U component
     im0 = axes[0, 0].imshow(target_u, cmap='RdBu_r')
     axes[0, 0].set_title('Ground Truth U')
+    axes[0, 0].axis('off')
     plt.colorbar(im0, ax=axes[0, 0])
 
     im1 = axes[1, 0].imshow(pred_u, cmap='RdBu_r')
     axes[1, 0].set_title('Predicted U')
+    axes[1, 0].axis('off')
     plt.colorbar(im1, ax=axes[1, 0])
 
     # Plot V component
     im2 = axes[0, 1].imshow(target_v, cmap='RdBu_r')
     axes[0, 1].set_title('Ground Truth V')
+    axes[0, 1].axis('off')
     plt.colorbar(im2, ax=axes[0, 1])
 
     im3 = axes[1, 1].imshow(pred_v, cmap='RdBu_r')
     axes[1, 1].set_title('Predicted V')
+    axes[1, 1].axis('off')
     plt.colorbar(im3, ax=axes[1, 1])
 
     # Plot magnitude
     im4 = axes[0, 2].imshow(target_mag, cmap='viridis')
     axes[0, 2].set_title('Ground Truth Magnitude')
+    axes[0, 2].axis('off')
     plt.colorbar(im4, ax=axes[0, 2])
 
     im5 = axes[1, 2].imshow(pred_mag, cmap='viridis')
     axes[1, 2].set_title('Predicted Magnitude')
+    axes[1, 2].axis('off')
     plt.colorbar(im5, ax=axes[1, 2])
+
+    # Plot spatial errors (absolute errors)
+    im6 = axes[2, 0].imshow(u_error, cmap='Reds')  # Changed colormap for errors
+    axes[2, 0].set_title('Absolute Error: U')
+    axes[2, 0].axis('off')
+    plt.colorbar(im6, ax=axes[2, 0])
+
+    im7 = axes[2, 1].imshow(v_error, cmap='Reds')
+    axes[2, 1].set_title('Absolute Error: V')
+    axes[2, 1].axis('off')
+    plt.colorbar(im7, ax=axes[2, 1])
+
+    im8 = axes[2, 2].imshow(magnitude_error, cmap='Reds')  # Fixed typo
+    axes[2, 2].set_title('Absolute Error: Magnitude')
+    axes[2, 2].axis('off')
+    plt.colorbar(im8, ax=axes[2, 2])
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -328,6 +453,7 @@ def eval_model(
     num_ode_steps: int = 50,
     num_rollout_steps: int = 10,
     output_dir: Optional[Path] = None,
+    max_batches: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Evaluate fluid dynamics model.
@@ -359,8 +485,6 @@ def eval_model(
     # Metrics accumulators
     all_single_step_metrics = {
         'mse': [],
-        'mae': [],
-        'relative_error': [],
         'u_mse': [],
         'v_mse': [],
         'magnitude_mse': [],
@@ -382,6 +506,9 @@ def eval_model(
     logger.info(f"ODE steps: {num_ode_steps}")
 
     for batch_idx, batch in enumerate(data_loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            logger.info(f"Reached max_batches limit ({max_batches}), stopping evaluation")
+            break
         # Get data
         x_target = batch['x_target'].to(device)
         x_prev_1 = batch['x_prev_1'].to(device)
@@ -389,14 +516,19 @@ def eval_model(
         case_params = batch.get('case_params', None)
         if case_params is not None:
             case_params = case_params.to(device)
+        
+        # get mask
+        mask = batch.get('mask', None)
+        if mask is not None:
+            mask = mask.to(device)
 
         # Single-step prediction
         predicted = single_step_prediction(
             cfg_model, x_prev_1, x_prev_2, case_params, device, cfg_scale, num_ode_steps
         )
 
-        # Compute metrics
-        metrics = compute_physical_metrics(predicted, x_target)
+         # Compute metrics WITH MASK
+        metrics = compute_physical_metrics(predicted, x_target, mask)
         for key, value in metrics.items():
             all_single_step_metrics[key].append(value)
 
@@ -406,8 +538,10 @@ def eval_model(
         # Save first batch visualization
         if not snapshots_saved and output_dir:
             visualize_prediction(
-                predicted, x_target,
-                output_dir / "snapshots" / f"epoch_{epoch}_batch_{batch_idx}.png"
+                predicted=predicted, 
+                target=x_target,
+                save_path=output_dir / "snapshots" / f"epoch_{epoch}_batch_{batch_idx}.png",
+                mask=mask
             )
             snapshots_saved = True
 
@@ -465,3 +599,234 @@ def eval_model(
     logger.info("="*60)
 
     return eval_metrics
+
+
+@torch.no_grad()
+def eval_model_with_crps(
+    model,
+    data_loader,
+    device,
+    epoch,
+    n_ensemble=50,
+    num_ode_steps=50,
+    cfg_scale=1.0
+):
+    """
+    Evaluate model with CRPS for probabilistic forecasting.
+    
+    Args:
+        model: FluidDynamicsUNet model
+        data_loader: Validation/test data loader
+        device: Device to use
+        epoch: Current epoch (for logging)
+        n_ensemble: Number of ensemble members to generate
+        num_ode_steps: ODE solver steps
+        cfg_scale: Classifier-free guidance scale (1.0 = no guidance)
+    
+    Returns:
+        Dictionary of metrics
+    """
+    from flow_matching.solver import ODESolver
+    
+    model.eval()
+    
+    # Initialize metrics
+    crps_u = ContinuousRankedProbabilityScore().to(device)
+    crps_v = ContinuousRankedProbabilityScore().to(device)
+    crps_magnitude = ContinuousRankedProbabilityScore().to(device)
+    
+    mse_metric = MeanMetric().to(device)
+    mae_metric = MeanMetric().to(device)
+    
+    # For tracking per-pixel CRPS
+    spatial_crps_u = []
+    spatial_crps_v = []
+    
+    logger.info(f"Evaluating with {n_ensemble} ensemble members...")
+    
+    for batch_idx, batch in enumerate(tqdm(data_loader, desc=f"CRPS Eval Epoch {epoch}")):
+        x_prev_1 = batch['x_prev_1'].to(device)  # (B, 2, H, W)
+        x_prev_2 = batch['x_prev_2'].to(device)
+        x_target = batch['x_target'].to(device)
+        case_params = batch['case_params'].to(device)
+        mask = batch.get('mask', None)
+        if mask is not None:
+            mask = mask.to(device)
+        
+        B, C, H, W = x_target.shape
+        
+        # Generate ensemble forecasts
+        ensemble_preds = []
+        
+        for ens_idx in range(n_ensemble):
+            # Generate single forecast
+            pred = generate_single_forecast(
+                model, x_prev_1, x_prev_2, case_params,
+                device, num_ode_steps, cfg_scale
+            )
+            ensemble_preds.append(pred)
+        
+        ensemble_preds = torch.stack(ensemble_preds, dim=1)  # (B, n_ensemble, 2, H, W)
+        
+        # Compute ensemble mean for MSE/MAE
+        ensemble_mean = ensemble_preds.mean(dim=1)  # (B, 2, H, W)
+        
+        if mask is not None:
+            # Masked MSE/MAE
+            mse = ((ensemble_mean - x_target) ** 2 * mask).sum() / mask.sum()
+            mae = (torch.abs(ensemble_mean - x_target) * mask).sum() / mask.sum()
+        else:
+            mse = F.mse_loss(ensemble_mean, x_target)
+            mae = F.l1_loss(ensemble_mean, x_target)
+        
+        mse_metric.update(mse)
+        mae_metric.update(mae)
+        
+        # Compute CRPS for each channel
+        # Need to reshape: (B, n_ensemble, H, W) for each channel
+        
+        # U-velocity CRPS (per pixel, then average)
+        u_ensemble = ensemble_preds[:, :, 0, :, :]  # (B, n_ensemble, H, W)
+        u_target = x_target[:, 0, :, :]  # (B, H, W)
+        
+        # Flatten spatial dimensions for CRPS computation
+        u_ensemble_flat = u_ensemble.reshape(B, n_ensemble, -1)  # (B, n_ensemble, H*W)
+        u_target_flat = u_target.reshape(B, -1)  # (B, H*W)
+        
+        # Compute CRPS per pixel
+        for pixel_idx in range(H * W):
+            if mask is not None:
+                # Check if this pixel is valid
+                pixel_h = pixel_idx // W
+                pixel_w = pixel_idx % W
+                if mask[:, 0, pixel_h, pixel_w].sum() == 0:
+                    continue  # Skip masked pixels
+            
+            crps_u.update(
+                u_ensemble_flat[:, :, pixel_idx],  # (B, n_ensemble)
+                u_target_flat[:, pixel_idx]        # (B,)
+            )
+        
+        # V-velocity CRPS
+        v_ensemble = ensemble_preds[:, :, 1, :, :]
+        v_target = x_target[:, 1, :, :]
+        
+        v_ensemble_flat = v_ensemble.reshape(B, n_ensemble, -1)
+        v_target_flat = v_target.reshape(B, -1)
+        
+        for pixel_idx in range(H * W):
+            if mask is not None:
+                pixel_h = pixel_idx // W
+                pixel_w = pixel_idx % W
+                if mask[:, 0, pixel_h, pixel_w].sum() == 0:
+                    continue
+            
+            crps_v.update(
+                v_ensemble_flat[:, :, pixel_idx],
+                v_target_flat[:, pixel_idx]
+            )
+        
+        # Magnitude CRPS
+        magnitude_ensemble = torch.sqrt(
+            ensemble_preds[:, :, 0] ** 2 + ensemble_preds[:, :, 1] ** 2
+        )  # (B, n_ensemble, H, W)
+        magnitude_target = torch.sqrt(
+            x_target[:, 0] ** 2 + x_target[:, 1] ** 2
+        )  # (B, H, W)
+        
+        mag_ensemble_flat = magnitude_ensemble.reshape(B, n_ensemble, -1)
+        mag_target_flat = magnitude_target.reshape(B, -1)
+        
+        for pixel_idx in range(H * W):
+            if mask is not None:
+                pixel_h = pixel_idx // W
+                pixel_w = pixel_idx % W
+                if mask[:, 0, pixel_h, pixel_w].sum() == 0:
+                    continue
+            
+            crps_magnitude.update(
+                mag_ensemble_flat[:, :, pixel_idx],
+                mag_target_flat[:, pixel_idx]
+            )
+    
+    # Compute final metrics
+    results = {
+        'crps_u': crps_u.compute().item(),
+        'crps_v': crps_v.compute().item(),
+        'crps_magnitude': crps_magnitude.compute().item(),
+        'crps_mean': (crps_u.compute() + crps_v.compute()).item() / 2,
+        'ensemble_mse': mse_metric.compute().item(),
+        'ensemble_mae': mae_metric.compute().item(),
+    }
+    
+    logger.info(f"CRPS Results - U: {results['crps_u']:.6f}, V: {results['crps_v']:.6f}, Mag: {results['crps_magnitude']:.6f}")
+    
+    return results
+
+
+def generate_single_forecast(model, x_prev_1, x_prev_2, case_params, device, num_ode_steps, cfg_scale=1.0):
+    """
+    Generate a single forecast using ODE solver.
+    
+    Args:
+        model: FluidDynamicsUNet
+        x_prev_1, x_prev_2: Previous states
+        case_params: Case parameters
+        device: Device
+        num_ode_steps: Number of ODE integration steps
+        cfg_scale: Classifier-free guidance scale
+    
+    Returns:
+        Predicted state (B, 2, H, W)
+    """
+    from flow_matching.solver import ODESolver
+    
+    class ModelWrapper(nn.Module):
+        def __init__(self, model, x_prev_1, x_prev_2, case_params, cfg_scale):
+            super().__init__()
+            self.model = model
+            self.x_prev_1 = x_prev_1
+            self.x_prev_2 = x_prev_2
+            self.case_params = case_params
+            self.cfg_scale = cfg_scale
+        
+        def forward(self, t, x):
+            batch_size = x.shape[0]
+            if t.dim() == 0:
+                t = t.repeat(batch_size)
+            
+            if self.cfg_scale != 1.0:
+                # Classifier-free guidance
+                extra_cond = {
+                    'x_prev_1': self.x_prev_1,
+                    'x_prev_2': self.x_prev_2,
+                    'case_params': self.case_params
+                }
+                extra_uncond = {
+                    'x_prev_1': self.x_prev_1,
+                    'x_prev_2': self.x_prev_2,
+                    'case_params': None
+                }
+                
+                v_cond = self.model(x, t, extra_cond)
+                v_uncond = self.model(x, t, extra_uncond)
+                
+                return v_uncond + self.cfg_scale * (v_cond - v_uncond)
+            else:
+                extra = {
+                    'x_prev_1': self.x_prev_1,
+                    'x_prev_2': self.x_prev_2,
+                    'case_params': self.case_params
+                }
+                return self.model(x, t, extra)
+    
+    wrapped_model = ModelWrapper(model, x_prev_1, x_prev_2, case_params, cfg_scale)
+    solver = ODESolver(wrapped_model)
+    
+    # Start from Gaussian noise
+    x_0 = torch.randn_like(x_prev_1)
+    
+    # Solve ODE from t=0 to t=1
+    x_1 = solver.sample(x_0, step_size=1.0 / num_ode_steps)
+    
+    return x_1

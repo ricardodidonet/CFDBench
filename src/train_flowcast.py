@@ -12,14 +12,38 @@ from torch.utils.data import DataLoader
 
 from dataset import get_auto_dataset
 from training.train_loop import train_epoch
-from training.eval_loop import eval_model
+from training.eval_loop import eval_model, eval_model_with_crps
 from training.load_and_save import load_model, save_model
 from training.grad_scaler import NativeScalerWithGradNormCount as NativeScaler
 from dataset.wrapper import FlowCastWrapperDataset
 from models.fluid_unet import FluidDynamicsUNet
 from args import Args
 
+
 logger = logging.getLogger(__name__)
+
+def collate_fn(batch):
+    x_prev_2 = torch.stack([item['x_prev_2'] for item in batch])
+    x_prev_1 = torch.stack([item['x_prev_1'] for item in batch])
+    x_target = torch.stack([item['x_target'] for item in batch])
+    
+    # Auto-detect: Get keys from first sample, use consistently
+    case_params_list = [item['case_params'] for item in batch]
+    param_keys = sorted(case_params_list[0].keys())  # Sort for consistency!
+    
+    # Convert to tensor with fixed key order
+    case_params_tensor = torch.tensor([
+        [float(params[key]) for key in param_keys]
+        for params in case_params_list
+    ])
+    
+    return {
+        'x_prev_2': x_prev_2[:, :2],      # Only velocity channels (u, v)
+        'x_prev_1': x_prev_1[:, :2],      # Only velocity channels (u, v)
+        'x_target': x_target[:, :2],      # Only velocity channels (u, v)
+        'mask': x_target[:, 2:3],         # Keep mask channel separate (shape: B, 1, H, W)
+        'case_params': case_params_tensor
+    }
 
 
 def main():
@@ -28,23 +52,24 @@ def main():
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-    args = Args.parse_args()
+    args = Args().parse_args()
 
     # Set up device
     device = torch.device(args.device)
     logger.info(f"Using device: {device}")
 
     # Create save directory
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load or create data
-    if args.data_path is not None:
+    # Load data
+    if args.data_dir is not None:
         logger.info(f"Loading data from {args.data_dir}")
     
     # Create base datasets
-    base_dataset_train, base_dataset_val = get_auto_dataset(
-    data_dir=args.data_dir,
+    data_dir = Path(args.data_dir)
+    base_dataset_train, base_dataset_val, _ = get_auto_dataset(
+    data_dir=data_dir,
     data_name='cylinder_geo',
     delta_time=0.1,
     norm_props=True,
@@ -66,7 +91,9 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,                                                                 
+        collate_fn=collate_fn,
+        pin_memory=True,
+        drop_last=True,                                                                 
     )
 
     val_loader = DataLoader(
@@ -74,7 +101,9 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        collate_fn=collate_fn,
         pin_memory=True,
+        drop_last=True,
     )
 
     # Create model
@@ -123,6 +152,7 @@ def main():
 
     load_model(
         args=args,
+        model=model,
         optimizer=optimizer,
         loss_scaler=loss_scaler,
         lr_schedule=lr_schedule,
@@ -166,13 +196,29 @@ def main():
                     epoch=epoch,
                 )
            
+            num_ode_steps = 25 if not args.eval_only else 50
             eval_stats = eval_model(
                 model=model,
                 data_loader=val_loader,
                 device=device,
                 epoch=epoch,
+                num_ode_steps=num_ode_steps,
+                output_dir=args.output_dir,
+                max_batches=10
             )
-            log_stats.update({f"eval_{k}": v for k, v in eval_stats.items()})
+            log_stats.update({f"{k}": v for k, v in eval_stats.items()})
+
+            # CRPS evaluation (slower, every 10 epochs)
+            if args.eval_crps and (epoch + 1) % 10 == 0:
+                crps_stats = eval_model_with_crps(
+                    model=model,
+                    data_loader=val_loader,
+                    device=device,
+                    epoch=epoch,
+                    n_ensemble=50,
+                    num_ode_steps=50
+                )
+                log_stats.update({f"crps_{k}": v for k, v in crps_stats.items()})
 
         if args.output_dir:
             with open(

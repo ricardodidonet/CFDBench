@@ -1,8 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the CC-by-NC license found in the
-# LICENSE file in the root directory of this source tree.
 
 """
 UNet model for fluid dynamics with autoregressive conditioning.
@@ -118,12 +113,12 @@ class AttentionBlock(nn.Module):
         B, C, H, W = x.shape
         h = self.norm(x)
         qkv = self.qkv(h)
-        q, k, v = qkv.chunk(3, dim=1)
+        q, k, v = torch.chunk(qkv, 3, dim=1)
 
         # Reshape for multi-head attention
-        q = q.reshape(B, self.num_heads, C // self.num_heads, H * W).transpose(2, 3)
-        k = k.reshape(B, self.num_heads, C // self.num_heads, H * W).transpose(2, 3)
-        v = v.reshape(B, self.num_heads, C // self.num_heads, H * W).transpose(2, 3)
+        q = q.reshape(B, self.num_heads, C // self.num_heads, H * W).permute(0, 1, 3, 2)
+        k = k.reshape(B, self.num_heads, C // self.num_heads, H * W).permute(0, 1, 3, 2)
+        v = v.reshape(B, self.num_heads, C // self.num_heads, H * W).permute(0, 1, 3, 2)
 
         # Attention
         scale = (C // self.num_heads) ** -0.5
@@ -131,7 +126,7 @@ class AttentionBlock(nn.Module):
         h = torch.matmul(attn, v)
 
         # Reshape back
-        h = h.transpose(2, 3).reshape(B, C, H, W)
+        h = h.permute(0, 1, 3, 2).reshape(B, C, H, W)
         h = self.proj_out(h)
 
         return x + h
@@ -216,7 +211,7 @@ class FluidDynamicsUNet(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim),
         )
 
-        # Case parameter embedding (if provided)
+        # Case parameter embedding
         if num_case_params > 0:
             if use_fourier_conditioning:
                 fourier_dim = num_case_params * num_fourier_freqs * 2
@@ -237,31 +232,34 @@ class FluidDynamicsUNet(nn.Module):
         input_channels = in_channels * 3
         self.input_proj = nn.Conv2d(input_channels, model_channels, 3, padding=1)
 
-        # Encoder
-        self.encoder_blocks = nn.ModuleList()
-        self.downsample_blocks = nn.ModuleList()
-
+        # Build encoder levels
+        self.encoder_levels = nn.ModuleList()
         ch = model_channels
-        encoder_channels = [ch]
-        ds = 1  # Current downsampling factor
-
+        self.encoder_channels = [ch]
+        
         for level, mult in enumerate(channel_mult):
+            level_blocks = nn.ModuleList()
+            
+            # Add ResBlocks for this level
             for _ in range(num_res_blocks):
                 block = nn.ModuleList([
                     ResBlock(ch, model_channels * mult, time_emb_dim, dropout)
                 ])
                 ch = model_channels * mult
-
-                if ds in attention_resolutions:
+                
+                # Add attention if needed
+                if level in attention_resolutions:
                     block.append(AttentionBlock(ch, num_heads=num_heads))
-
-                self.encoder_blocks.append(block)
-                encoder_channels.append(ch)
-
+                
+                level_blocks.append(block)
+                self.encoder_channels.append(ch)
+            
+            # Add downsample if not last level
             if level != len(channel_mult) - 1:
-                self.downsample_blocks.append(Downsample(ch))
-                encoder_channels.append(ch)
-                ds *= 2
+                level_blocks.append(nn.ModuleList([Downsample(ch)]))
+                self.encoder_channels.append(ch)
+            
+            self.encoder_levels.append(level_blocks)
 
         # Middle
         self.middle_block = nn.ModuleList([
@@ -270,26 +268,30 @@ class FluidDynamicsUNet(nn.Module):
             ResBlock(ch, ch, time_emb_dim, dropout),
         ])
 
-        # Decoder
-        self.decoder_blocks = nn.ModuleList()
-        self.upsample_blocks = nn.ModuleList()
-
+        # Build decoder levels
+        self.decoder_levels = nn.ModuleList()
+        
         for level, mult in reversed(list(enumerate(channel_mult))):
+            level_blocks = nn.ModuleList()
+            
             for i in range(num_res_blocks + 1):
-                encoder_ch = encoder_channels.pop()
+                encoder_ch = self.encoder_channels.pop()
                 block = nn.ModuleList([
                     ResBlock(ch + encoder_ch, model_channels * mult, time_emb_dim, dropout)
                 ])
                 ch = model_channels * mult
-
-                if ds in attention_resolutions:
+                
+                # Add attention if needed
+                if level in attention_resolutions:
                     block.append(AttentionBlock(ch, num_heads=num_heads))
-
-                if level != 0 and i == num_res_blocks:
-                    self.upsample_blocks.append(Upsample(ch))
-                    ds //= 2
-
-                self.decoder_blocks.append(block)
+                
+                level_blocks.append(block)
+            
+            # Add upsample if not first level
+            if level != 0:
+                level_blocks.append(nn.ModuleList([Upsample(ch)]))
+            
+            self.decoder_levels.append(level_blocks)
 
         # Output
         self.output = nn.Sequential(
@@ -300,29 +302,23 @@ class FluidDynamicsUNet(nn.Module):
 
     def forward(self, x_t, t, extra):
         """
-        Forward pass of the UNet.
-
         Args:
-            x_t: Current noisy state at time t, shape (B, 2, 64, 64)
-            t: Flow matching timesteps in [0, 1], shape (B,)
-            extra: Dictionary containing:
-                - 'x_prev_1': Previous state at t-1, shape (B, 2, 64, 64)
-                - 'x_prev_2': Previous state at t-2, shape (B, 2, 64, 64)
-                - 'case_params': Optional case parameters, shape (B, num_case_params)
-
-        Returns:
-            Predicted velocity field, shape (B, 2, 64, 64)
+            x_t: Current noisy state (B, 2, H, W)
+            t: Timesteps (B,) in [0, 1]
+            extra: Dict with:
+                - 'x_prev_1': Previous state at t-1 (B, 2, H, W)
+                - 'x_prev_2': Previous state at t-2 (B, 2, H, W)
+                - 'case_params': Case parameters (B, D) or None
         """
-        # Extract arguments from extra dict
         x_prev_1 = extra['x_prev_1']
         x_prev_2 = extra['x_prev_2']
         case_params = extra.get('case_params', None)
 
-        # Time embedding
+        # Timestep embedding
         time_emb = self.time_embed(t)
 
-        # Add case parameter embedding if provided
-        if case_params is not None and self.num_case_params > 0:
+        # Case parameter embedding
+        if self.num_case_params > 0 and case_params is not None:
             if self.use_fourier_conditioning:
                 case_features = fourier_embedding(
                     case_params,
@@ -340,19 +336,23 @@ class FluidDynamicsUNet(nn.Module):
         # Input projection
         h = self.input_proj(x)
 
-        # Encoder
-        encoder_features = [h]
-        for block in self.encoder_blocks:
-            for layer in block:
-                if isinstance(layer, ResBlock):
-                    h = layer(h, time_emb)
+        # Encoder - save features in forward order
+        encoder_features = [h]  # Include initial feature!
+        
+        for level_blocks in self.encoder_levels:
+            for block in level_blocks:
+                # Check if this is a downsample block
+                if len(block) == 1 and isinstance(block[0], Downsample):
+                    h = block[0](h)
+                    encoder_features.append(h)
                 else:
-                    h = layer(h)
-            encoder_features.append(h)
-
-        for downsample in self.downsample_blocks:
-            h = downsample(h)
-            encoder_features.append(h)
+                    # Process ResBlock and optional Attention
+                    for layer in block:
+                        if isinstance(layer, ResBlock):
+                            h = layer(h, time_emb)
+                        else:
+                            h = layer(h)
+                    encoder_features.append(h)
 
         # Middle
         for layer in self.middle_block:
@@ -361,24 +361,23 @@ class FluidDynamicsUNet(nn.Module):
             else:
                 h = layer(h)
 
-        # Decoder
-        upsample_idx = 0
-        for i, block in enumerate(self.decoder_blocks):
-            encoder_feat = encoder_features.pop()
-            h = torch.cat([h, encoder_feat], dim=1)
-
-            for layer in block:
-                if isinstance(layer, ResBlock):
-                    h = layer(h, time_emb)
+        # Decoder - pop in reverse order
+        for level_blocks in self.decoder_levels:
+            for block in level_blocks:
+                # Check if this is an upsample block
+                if len(block) == 1 and isinstance(block[0], Upsample):
+                    h = block[0](h)
                 else:
-                    h = layer(h)
-
-            # Check if we need to upsample after this block
-            if upsample_idx < len(self.upsample_blocks):
-                # Upsample after every (num_res_blocks + 1) decoder blocks, except the last level
-                if (i + 1) % (2 + 1) == 0:  # Assuming num_res_blocks=2
-                    h = self.upsample_blocks[upsample_idx](h)
-                    upsample_idx += 1
+                    # Concatenate with skip connection BEFORE processing
+                    encoder_feat = encoder_features.pop()
+                    h = torch.cat([h, encoder_feat], dim=1)
+                    
+                    # Process ResBlock and optional Attention
+                    for layer in block:
+                        if isinstance(layer, ResBlock):
+                            h = layer(h, time_emb)
+                        else:
+                            h = layer(h)
 
         # Output
         return self.output(h)
