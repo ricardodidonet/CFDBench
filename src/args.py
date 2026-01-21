@@ -261,16 +261,25 @@ class Args(Tap):
     pixel_diffusion_dropout: float = 0.1
     """Dropout rate for PUNetG ResNet blocks"""
 
-    # --- Fluid UNET --- 
-    model_channels: int = 128
+    # --- Fluid UNET ---
+    model_channels: int = 64
+    """Base channel count for UNet (reduced from 128 to reduce parameters)"""
 
-    num_res_blocks: int = 2
+    num_res_blocks: int = 1
+    """Number of ResNet blocks per resolution level (reduced from 2)"""
+
+    channel_mult: tuple = (1, 2, 4)
+    """Channel multipliers per level - creates 64, 128, 256 channels at 3 levels"""
+
+    attention_resolutions: tuple = ()
+    """Resolutions to apply attention (empty = no attention, saves memory)"""
 
     num_case_params: int = 8
 
     use_fourier_conditioning: bool = True
 
-    num_fourier_freqs: int = 16
+    num_fourier_freqs: int = 8
+    """Number of Fourier frequencies for case parameters (reduced from 16)"""
 
 
     # ============================================================================

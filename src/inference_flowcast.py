@@ -296,15 +296,18 @@ def main():
     
     # Load model
     logger.info(f"Loading model from {args.output_dir}...")
+    # NOTE: Update these parameters to match your trained checkpoint
     model = FluidDynamicsUNet(
         in_channels=2,
         out_channels=2,
-        model_channels=128,
-        num_res_blocks=2,
-        dropout=0.1,
+        model_channels=64,  # Updated to match new default
+        channel_mult=(1, 2, 4),  # Updated to match new default
+        num_res_blocks=1,  # Updated to match new default
+        attention_resolutions=(),  # No attention by default
+        dropout=0.2,  # Updated to match new default
         num_case_params=8,
         use_fourier_conditioning=True,
-        num_fourier_freqs=16,
+        num_fourier_freqs=8,  # Updated to match new default
     ).to(device)
     
     checkpoint_path = Path(args.output_dir) / Path(args.checkpoint)
