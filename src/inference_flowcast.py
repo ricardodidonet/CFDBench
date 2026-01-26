@@ -25,6 +25,89 @@ from flow_matching.solver import ODESolver
 logger = logging.getLogger(__name__)
 
 
+class CFGModelWrapper(nn.Module):
+    """
+    Model wrapper that implements Classifier-Free Guidance (CFG) for flow matching.
+
+    CFG interpolates between unconditional and conditional predictions:
+        output = uncond_output + cfg_scale * (cond_output - uncond_output)
+
+    When cfg_scale=1.0, this reduces to standard conditional generation.
+    When cfg_scale>1.0, conditioning is amplified.
+    When cfg_scale<1.0, conditioning is weakened.
+
+    Args:
+        model: The base FluidDynamicsUNet model
+        x_prev_1: Previous state at t-1, shape (B, 2, H, W)
+        x_prev_2: Previous state at t-2, shape (B, 2, H, W)
+        case_params: Case parameters, shape (B, D)
+        cfg_scale: Classifier-free guidance scale (default: 1.0, no guidance)
+        uncond_case_params: Optional unconditional case params (default: zeros)
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        x_prev_1: torch.Tensor,
+        x_prev_2: torch.Tensor,
+        case_params: torch.Tensor,
+        cfg_scale: float = 1.0,
+        uncond_case_params: torch.Tensor = None
+    ):
+        super().__init__()
+        self.model = model
+        self.x_prev_1 = x_prev_1
+        self.x_prev_2 = x_prev_2
+        self.case_params = case_params
+        self.cfg_scale = cfg_scale
+
+        # Default unconditional embedding: zeros
+        if uncond_case_params is None:
+            self.uncond_case_params = torch.zeros_like(case_params)
+        else:
+            self.uncond_case_params = uncond_case_params
+
+    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass with optional CFG.
+
+        Args:
+            t: Time tensor, shape (B,) or scalar
+            x: Current state, shape (B, 2, H, W)
+
+        Returns:
+            Velocity field prediction, shape (B, 2, H, W)
+        """
+        batch_size = x.shape[0]
+        if t.dim() == 0:
+            t = t.repeat(batch_size)
+
+        # Conditional prediction
+        extra_cond = {
+            'x_prev_1': self.x_prev_1,
+            'x_prev_2': self.x_prev_2,
+            'case_params': self.case_params
+        }
+        cond_output = self.model(x, t, extra_cond)
+
+        # If cfg_scale is 1.0, skip unconditional pass for efficiency
+        if self.cfg_scale == 1.0:
+            return cond_output
+
+        # Unconditional prediction
+        extra_uncond = {
+            'x_prev_1': self.x_prev_1,
+            'x_prev_2': self.x_prev_2,
+            'case_params': self.uncond_case_params
+        }
+        uncond_output = self.model(x, t, extra_uncond)
+
+        # CFG interpolation: uncond + scale * (cond - uncond)
+        guided_output = uncond_output + self.cfg_scale * (cond_output - uncond_output)
+
+        return guided_output
+
+
 def collate_fn(batch):
     x_prev_2 = torch.stack([item['x_prev_2'] for item in batch])
     x_prev_1 = torch.stack([item['x_prev_1'] for item in batch])
@@ -50,10 +133,18 @@ def collate_fn(batch):
 
 
 @torch.no_grad()
-def generate_forecast(model, x_prev_1, x_prev_2, case_params, device, num_ode_steps=50):
+def generate_forecast(
+    model,
+    x_prev_1,
+    x_prev_2,
+    case_params,
+    device,
+    num_ode_steps=50,
+    cfg_scale=1.0
+):
     """
     Generate a single-step forecast using flow matching ODE solver.
-    
+
     Args:
         model: Trained FluidDynamicsUNet
         x_prev_1: Previous state at t-1, shape (B, 2, H, W)
@@ -61,57 +152,41 @@ def generate_forecast(model, x_prev_1, x_prev_2, case_params, device, num_ode_st
         case_params: Case parameters, shape (B, D)
         device: Device
         num_ode_steps: Number of ODE integration steps
-        
+        cfg_scale: Classifier-free guidance scale. 1.0 = no guidance,
+                   >1.0 amplifies conditioning, <1.0 weakens conditioning
+
     Returns:
         Predicted next state, shape (B, 2, H, W)
     """
     model.eval()
-    
-    # Wrapper for ODESolver
-    class ModelWrapper(nn.Module):
-        def __init__(self, model, x_prev_1, x_prev_2, case_params):
-            super().__init__()
-            self.model = model
-            self.x_prev_1 = x_prev_1
-            self.x_prev_2 = x_prev_2
-            self.case_params = case_params
-        
-        def forward(self, t, x):
-            batch_size = x.shape[0]
-            if t.dim() == 0:
-                t = t.repeat(batch_size)
-            
-            extra = {
-                'x_prev_1': self.x_prev_1,
-                'x_prev_2': self.x_prev_2,
-                'case_params': self.case_params
-            }
-            return self.model(x, t, extra)
-    
-    wrapped_model = ModelWrapper(model, x_prev_1, x_prev_2, case_params)
+
+    wrapped_model = CFGModelWrapper(
+        model, x_prev_1, x_prev_2, case_params, cfg_scale=cfg_scale
+    )
     solver = ODESolver(wrapped_model)
-    
+
     # Start from Gaussian noise
     x_0 = torch.randn_like(x_prev_1)
-    
+
     # Solve ODE from t=0 to t=1
     x_1 = solver.sample(x_0, step_size=1.0 / num_ode_steps)
-    
+
     return x_1
 
 
 @torch.no_grad()
 def generate_multistep_forecast(
-    model, 
-    initial_states, 
-    case_params, 
-    num_steps, 
-    device, 
-    num_ode_steps=50
+    model,
+    initial_states,
+    case_params,
+    num_steps,
+    device,
+    num_ode_steps=50,
+    cfg_scale=1.0
 ):
     """
     Generate multi-step autoregressive forecast.
-    
+
     Args:
         model: Trained model
         initial_states: List of 2 initial states [x_{t-2}, x_{t-1}], each (B, 2, H, W)
@@ -119,26 +194,29 @@ def generate_multistep_forecast(
         num_steps: Number of future steps to predict
         device: Device
         num_ode_steps: Number of ODE integration steps per prediction
-        
+        cfg_scale: Classifier-free guidance scale. 1.0 = no guidance,
+                   >1.0 amplifies conditioning, <1.0 weakens conditioning
+
     Returns:
         predictions: List of predicted states, length num_steps, each (B, 2, H, W)
     """
     model.eval()
-    
+
     predictions = []
     x_prev_2, x_prev_1 = initial_states
-    
+
     for step in range(num_steps):
         # Generate next prediction
         x_next = generate_forecast(
-            model, x_prev_1, x_prev_2, case_params, device, num_ode_steps
+            model, x_prev_1, x_prev_2, case_params, device, num_ode_steps,
+            cfg_scale=cfg_scale
         )
         predictions.append(x_next.cpu())
-        
+
         # Shift states for next iteration
         x_prev_2 = x_prev_1
         x_prev_1 = x_next
-    
+
     return predictions
 
 
@@ -259,7 +337,10 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device')
     parser.add_argument('--save_numpy', action='store_true', help='Save predictions as numpy arrays')
     parser.add_argument('--visualize', action='store_true', help='Create visualizations')
-    
+    parser.add_argument('--cfg_scale', type=float, default=1.0,
+                        help='Classifier-free guidance scale. 1.0 = no guidance, '
+                             '>1.0 amplifies conditioning, <1.0 weakens conditioning')
+
     args = parser.parse_args()
     
     logging.basicConfig(
@@ -320,7 +401,8 @@ def main():
     
     model.eval()
     logger.info("Model loaded successfully")
-    
+    logger.info(f"Using CFG scale: {args.cfg_scale}")
+
     # Generate forecasts
     all_metrics = []
     
@@ -344,7 +426,8 @@ def main():
                 case_params,
                 args.num_forecast_steps,
                 device,
-                args.num_ode_steps
+                args.num_ode_steps,
+                cfg_scale=args.cfg_scale
             )
             
             # For metrics, we need ground truth (requires accessing multiple future timesteps)
@@ -377,6 +460,7 @@ def main():
         'checkpoint': str(args.checkpoint),
         'num_forecast_steps': args.num_forecast_steps,
         'num_ode_steps': args.num_ode_steps,
+        'cfg_scale': args.cfg_scale,
         'num_samples_processed': min(args.num_samples, len(dataset_test)),
     }
     
