@@ -19,6 +19,7 @@ import json
 
 from dataset import get_auto_dataset
 from dataset.wrapper import FlowCastWrapperDataset
+from dataset.multistep_wrapper import MultiStepFlowCastDataset, multi_step_collate_fn
 from models.fluid_unet import FluidDynamicsUNet
 from flow_matching.solver import ODESolver
 
@@ -275,23 +276,37 @@ def main():
     # Load test dataset
     logger.info("Loading test dataset...")
     data_dir = Path(args.data_dir)
-    _, _, base_dataset_test = get_auto_dataset(
+
+    # Get training dataset to compute normalization stats
+    base_dataset_train, _, base_dataset_test = get_auto_dataset(
         data_dir=data_dir,
         data_name='cylinder_geo',
         delta_time=0.1,
         norm_props=True,
         norm_bc=True,
-        load_splits=['test']
+        load_splits=['train', 'test']
     )
-    
-    dataset_test = FlowCastWrapperDataset(base_dataset_test)
+
+    # Compute normalization stats from training set
+    temp_train = FlowCastWrapperDataset(base_dataset_train, normalize=True)
+    norm_stats = temp_train.get_norm_stats()
+    logger.info("Using training set normalization stats for test set")
+
+    # Use MultiStepFlowCastDataset for proper ground truth
+    dataset_test = MultiStepFlowCastDataset(
+        base_dataset_test,
+        num_future_steps=args.num_forecast_steps,
+        normalize=True,
+        norm_stats=norm_stats
+    )
+
     test_loader = DataLoader(
         dataset_test,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
-        collate_fn=collate_fn
+        collate_fn=multi_step_collate_fn  # Use multi-step collate function
     )
     
     # Load model
@@ -337,6 +352,9 @@ def main():
             if mask is not None:
                 mask = mask.to(device)
             
+            # Ground truth from dataset (list of K tensors, each (B, 2, H, W))
+            ground_truth = [x.to(device) for x in batch['x_future']]
+
             # Generate multi-step forecast
             predictions = generate_multistep_forecast(
                 model,
@@ -344,45 +362,87 @@ def main():
                 case_params,
                 args.num_forecast_steps,
                 device,
-                args.num_ode_steps
+                args.num_ode_steps,
+                cfg_scale=args.cfg_scale
             )
-            
-            # For metrics, we need ground truth (requires accessing multiple future timesteps)
-            # This is a simplified version - you may need to modify based on your data structure
-            
-            # Save predictions
+
+            # Move predictions to device for metrics
+            predictions_device = [p.to(device) for p in predictions]
+
+            # Compute metrics
+            metrics = compute_metrics(
+                torch.stack(predictions_device),  # (T, B, 2, H, W)
+                torch.stack(ground_truth),        # (T, B, 2, H, W)
+                mask
+            )
+            all_metrics.append(metrics)
+
+            logger.info(f"Batch {batch_idx}: MSE={metrics['mse']:.6f}, RMSE={metrics['rmse']:.6f}")
+
+            # Save predictions and ground truth
             if args.save_numpy:
                 for b in range(predictions[0].shape[0]):
                     sample_id = batch_idx * args.batch_size + b
-                    pred_array = torch.stack([p[b] for p in predictions]).numpy()
+                    pred_array = torch.stack([p[b] for p in predictions]).cpu().numpy()
+                    gt_array = torch.stack([g[b] for g in ground_truth]).cpu().numpy()
                     np.save(output_dir / f'prediction_{sample_id:04d}.npy', pred_array)
-            
+                    np.save(output_dir / f'ground_truth_{sample_id:04d}.npy', gt_array)
+
             # Visualize
             if args.visualize and batch_idx < 5:  # Only visualize first 5 batches
-                # Create ground truth list (you'll need to implement this based on your data)
-                ground_truth = [batch['x_target'].cpu() for _ in range(args.num_forecast_steps)]
-                
                 visualize_forecast(
                     [x_prev_2.cpu(), x_prev_1.cpu()],
-                    predictions,
-                    ground_truth,
+                    predictions,  # Already on CPU
+                    [g.cpu() for g in ground_truth],  # Move to CPU
                     output_dir / f'forecast_batch_{batch_idx:04d}.png',
                     sample_idx=0
                 )
     
     logger.info(f"Forecasts saved to {output_dir}")
-    
+
+    # Aggregate metrics
+    if all_metrics:
+        avg_mse = np.mean([m['mse'] for m in all_metrics])
+        avg_rmse = np.mean([m['rmse'] for m in all_metrics])
+        avg_mae = np.mean([m['mae'] for m in all_metrics])
+
+        # Average timestep MSE
+        num_steps = len(all_metrics[0]['timestep_mse'])
+        avg_timestep_mse = [
+            np.mean([m['timestep_mse'][t] for m in all_metrics])
+            for t in range(num_steps)
+        ]
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"OVERALL METRICS")
+        logger.info(f"{'='*60}")
+        logger.info(f"Average MSE:  {avg_mse:.6f}")
+        logger.info(f"Average RMSE: {avg_rmse:.6f}")
+        logger.info(f"Average MAE:  {avg_mae:.6f}")
+        logger.info(f"\nPer-timestep MSE:")
+        for t, mse in enumerate(avg_timestep_mse):
+            logger.info(f"  t+{t+1}: {mse:.6f}")
+
     # Save summary
     summary = {
         'checkpoint': str(args.checkpoint),
         'num_forecast_steps': args.num_forecast_steps,
         'num_ode_steps': args.num_ode_steps,
+        'cfg_scale': args.cfg_scale,
         'num_samples_processed': min(args.num_samples, len(dataset_test)),
     }
-    
+
+    if all_metrics:
+        summary['metrics'] = {
+            'avg_mse': float(avg_mse),
+            'avg_rmse': float(avg_rmse),
+            'avg_mae': float(avg_mae),
+            'timestep_mse': [float(x) for x in avg_timestep_mse]
+        }
+
     with open(output_dir / 'summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
-    
+
     logger.info("Inference complete!")
 
 
