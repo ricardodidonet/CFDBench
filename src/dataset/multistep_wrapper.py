@@ -129,9 +129,9 @@ class MultiStepFlowCastDataset(Dataset):
         x_prev_1, x_t, case_params = self.base_dataset[base_idx]
 
         # Collect future frames: [t, t+1, t+2, ..., t+K-1]
-        x_future = [x_t]
+        x_future = [x_t]  # First frame is the label from base_idx
         for k in range(1, self.num_future_steps):
-            x_future_k, _, _ = self.base_dataset[base_idx + k]
+            _, x_future_k, _ = self.base_dataset[base_idx + k]  # Get LABEL, not input!
             x_future.append(x_future_k)
 
         # Normalize if needed
