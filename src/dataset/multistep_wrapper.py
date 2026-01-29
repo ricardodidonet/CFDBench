@@ -122,17 +122,20 @@ class MultiStepFlowCastDataset(Dataset):
         """
         base_idx = self.valid_indices[index]
 
-        # Get t-2
+        # Get t-2 (CLONE to avoid in-place modification issues!)
         x_prev_2, _, _ = self.base_dataset[base_idx - 1]
+        x_prev_2 = x_prev_2.clone()
 
         # Get t-1, t, and case params
         x_prev_1, x_t, case_params = self.base_dataset[base_idx]
+        x_prev_1 = x_prev_1.clone()
+        x_t = x_t.clone()
 
         # Collect future frames: [t, t+1, t+2, ..., t+K-1]
         x_future = [x_t]  # First frame is the label from base_idx
         for k in range(1, self.num_future_steps):
             _, x_future_k, _ = self.base_dataset[base_idx + k]  # Get LABEL, not input!
-            x_future.append(x_future_k)
+            x_future.append(x_future_k.clone())  # CLONE before appending!
 
         # Normalize if needed
         if self.normalize:
