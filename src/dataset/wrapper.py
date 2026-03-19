@@ -15,19 +15,31 @@ class FlowCastWrapperDataset(Dataset):
 
     It assumes the base dataset provides (X_{t-1}, X_t, case_params).
     """
-    def __init__(self, base_dataset, normalize=True):
+    def __init__(self, base_dataset, normalize=True, norm_stats=None):
         """
         Args:
             base_dataset: An instance of a CfdAutoDataset subclass
                           (e.g., CavityFlowAutoDataset).
             normalize: whether to normalize the data.
+            norm_stats: Optional dict with 'u_mean', 'u_std', 'v_mean', 'v_std'.
+                       If provided, uses these stats instead of computing from data.
+                       Use this for validation/test sets to avoid data leakage.
         """
         self.base_dataset = base_dataset
         self.normalize = normalize
 
         if self.normalize:
-            # compute per-channel mean and std:
-            self.compute_normalization_stats()
+            if norm_stats is not None:
+                # Use provided stats (for val/test sets)
+                self.u_mean = norm_stats['u_mean']
+                self.u_std = norm_stats['u_std']
+                self.v_mean = norm_stats['v_mean']
+                self.v_std = norm_stats['v_std']
+                logger.info(f"Using provided normalization stats - u: mean={self.u_mean:.4f}, std={self.u_std:.4f}")
+                logger.info(f"Using provided normalization stats - v: mean={self.v_mean:.4f}, std={self.v_std:.4f}")
+            else:
+                # Compute stats from data (for training set)
+                self.compute_normalization_stats()
         
         # We need access to the original sequential data if possible,
         # but the base dataset pre-pairs t-1 and t.
@@ -57,15 +69,26 @@ class FlowCastWrapperDataset(Dataset):
             x, _, _ = self.base_dataset[i]
             all_u.append(x[0])  # u channel
             all_v.append(x[1])  # v channel
-        
+
         all_u = torch.stack(all_u)
         all_v = torch.stack(all_v)
-        
+
         self.u_mean, self.u_std = all_u.mean(), all_u.std()
         self.v_mean, self.v_std = all_v.mean(), all_v.std()
-        
+
         logger.info(f"Normalization stats - u: mean={self.u_mean:.4f}, std={self.u_std:.4f}")
         logger.info(f"Normalization stats - v: mean={self.v_mean:.4f}, std={self.v_std:.4f}")
+
+    def get_norm_stats(self):
+        """Return normalization statistics as a dictionary."""
+        if not self.normalize:
+            return None
+        return {
+            'u_mean': self.u_mean,
+            'u_std': self.u_std,
+            'v_mean': self.v_mean,
+            'v_std': self.v_std
+        }
 
 
     def __len__(self) -> int:

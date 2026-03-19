@@ -88,8 +88,9 @@ class CFGScaledFluidModel(ModelWrapper):
                 }
                 unconditional = self.model(x, t, extra_uncond)
 
-            # Guided velocity: v = v_uncond + scale * (v_cond - v_uncond)
-            result = unconditional + cfg_scale * (conditional - unconditional)
+            # Guided velocity: v = (1 + scale) * v_cond - scale * v_uncond
+            # This matches the flow matching library's CFG implementation
+            result = (1.0 + cfg_scale) * conditional - cfg_scale * unconditional
         else:
             # No guidance or no case params
             with torch.no_grad():
