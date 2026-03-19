@@ -70,10 +70,10 @@ def main():
     data_dir = Path(args.data_dir)
     base_dataset_train, base_dataset_val, _ = get_auto_dataset(
     data_dir=data_dir,
-    data_name='cylinder_geo',
-    delta_time=0.1,
-    norm_props=True,
-    norm_bc=True,
+    data_name=args.data_name,
+    delta_time=args.delta_time,
+    norm_props=args.norm_props,
+    norm_bc=args.norm_bc,
     load_splits=['train', 'dev']
 )
     # Wrapped dataset for flowcast

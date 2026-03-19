@@ -116,7 +116,7 @@ class Args(Tap):
     # 3. DATASET CONFIGURATION
     # ============================================================================
 
-    data_name: str = "cylinder_geo"
+    data_name: str = "cylinder_bc"
     """
     Dataset name format: '<problem>_<subsets>'
     Problems: cavity, tube, dam, cylinder
@@ -136,10 +136,10 @@ class Args(Tap):
     delta_time: float = 0.1
     """Time step size for autoregressive models"""
 
-    norm_props: int = 1
+    norm_props: bool = True
     """Whether to normalize physical properties (0=no, 1=yes)"""
 
-    norm_bc: int = 1
+    norm_bc: bool = True
     """Whether to normalize boundary conditions (0=no, 1=yes)"""
 
 
@@ -265,8 +265,8 @@ class Args(Tap):
     model_channels: int = 64
     """Base channel count for UNet (reduced from 128 to reduce parameters)"""
 
-    num_res_blocks: int = 1
-    """Number of ResNet blocks per resolution level (reduced from 2)"""
+    num_res_blocks: int = 2
+    """Number of ResNet blocks per resolution level"""
 
     channel_mult: tuple = (1, 2, 4)
     """Channel multipliers per level - creates 64, 128, 256 channels at 3 levels"""
@@ -278,7 +278,7 @@ class Args(Tap):
 
     use_fourier_conditioning: bool = True
 
-    num_fourier_freqs: int = 8
+    num_fourier_freqs: int = 32
     """Number of Fourier frequencies for case parameters (reduced from 16)"""
 
 

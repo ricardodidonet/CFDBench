@@ -16,120 +16,93 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import json
+from typing import Optional
 
 from dataset import get_auto_dataset
-from dataset.wrapper import FlowCastWrapperDataset
+from dataset.wrapper import MultiStepFlowCastDataset, multi_step_collate_fn
 from models.fluid_unet import FluidDynamicsUNet
 from flow_matching.solver import ODESolver
+from flow_matching.utils import ModelWrapper
 
 logger = logging.getLogger(__name__)
 
 
-class CFGModelWrapper(nn.Module):
+class CFGScaledFluidModel(ModelWrapper):
+
     """
-    Model wrapper that implements Classifier-Free Guidance (CFG) for flow matching.
+    Model wrapper for classifier-free guidance on case parameters.
 
-    CFG interpolates between unconditional and conditional predictions:
-        output = uncond_output + cfg_scale * (cond_output - uncond_output)
-
-    When cfg_scale=1.0, this reduces to standard conditional generation.
-    When cfg_scale>1.0, conditioning is amplified.
-    When cfg_scale<1.0, conditioning is weakened.
-
-    Args:
-        model: The base FluidDynamicsUNet model
-        x_prev_1: Previous state at t-1, shape (B, 2, H, W)
-        x_prev_2: Previous state at t-2, shape (B, 2, H, W)
-        case_params: Case parameters, shape (B, D)
-        cfg_scale: Classifier-free guidance scale (default: 1.0, no guidance)
-        uncond_case_params: Optional unconditional case params (default: zeros)
+    Similar to CFGScaledModel in eval_loop.py but adapted for fluid dynamics:
+    - Guidance on case_params instead of class labels
+    - Keeps x_prev_1, x_prev_2 (essential temporal conditioning)
     """
 
-    def __init__(
+    def __init__(self, model: nn.Module):
+        super().__init__(model)
+        self.nfe_counter = 0  # Track number of function evaluations
+
+    def forward(
         self,
-        model: nn.Module,
+        x: torch.Tensor,
+        t: torch.Tensor,
         x_prev_1: torch.Tensor,
         x_prev_2: torch.Tensor,
-        case_params: torch.Tensor,
-        cfg_scale: float = 1.0,
-        uncond_case_params: torch.Tensor = None
+        case_params: Optional[torch.Tensor],
+        cfg_scale: float
     ):
-        super().__init__()
-        self.model = model
-        self.x_prev_1 = x_prev_1
-        self.x_prev_2 = x_prev_2
-        self.case_params = case_params
-        self.cfg_scale = cfg_scale
-
-        # Default unconditional embedding: zeros
-        if uncond_case_params is None:
-            self.uncond_case_params = torch.zeros_like(case_params)
-        else:
-            self.uncond_case_params = uncond_case_params
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass with optional CFG.
+        Forward pass with classifier-free guidance.
 
         Args:
-            t: Time tensor, shape (B,) or scalar
-            x: Current state, shape (B, 2, H, W)
+            x: Current state (B, 2, H, W)
+            t: Time (scalar or (B,))
+            x_prev_1: Previous state at t-1 (B, 2, H, W)
+            x_prev_2: Previous state at t-2 (B, 2, H, W)
+            case_params: Case parameters (B, D) or None
+            cfg_scale: Guidance strength (0.0 = no guidance)
 
         Returns:
-            Velocity field prediction, shape (B, 2, H, W)
+            Predicted velocity field (B, 2, H, W)
         """
-        batch_size = x.shape[0]
+        # Broadcast time to batch size if needed
         if t.dim() == 0:
-            t = t.repeat(batch_size)
+            t = t.repeat(x.shape[0])
 
-        # Conditional prediction
-        extra_cond = {
-            'x_prev_1': self.x_prev_1,
-            'x_prev_2': self.x_prev_2,
-            'case_params': self.case_params
-        }
-        cond_output = self.model(x, t, extra_cond)
+        if cfg_scale != 0.0 and case_params is not None:
+            # Classifier-free guidance
+            with torch.no_grad():
+                # Conditional prediction (with case_params)
+                extra_cond = {
+                    'x_prev_1': x_prev_1,
+                    'x_prev_2': x_prev_2,
+                    'case_params': case_params
+                }
+                conditional = self.model(x, t, extra_cond)
 
-        # If cfg_scale is 1.0, skip unconditional pass for efficiency
-        if self.cfg_scale == 1.0:
-            return cond_output
+                # Unconditional prediction (without case_params)
+                extra_uncond = {
+                    'x_prev_1': x_prev_1,
+                    'x_prev_2': x_prev_2,
+                    'case_params': None
+                }
+                unconditional = self.model(x, t, extra_uncond)
 
-        # Unconditional prediction
-        extra_uncond = {
-            'x_prev_1': self.x_prev_1,
-            'x_prev_2': self.x_prev_2,
-            'case_params': self.uncond_case_params
-        }
-        uncond_output = self.model(x, t, extra_uncond)
+            # Guided velocity: v = (1 + scale) * v_cond - scale * v_uncond
+            # This matches the flow matching library's CFG implementation
+            result = (1.0 + cfg_scale) * conditional - cfg_scale * unconditional
+        else:
+            # No guidance or no case params
+            with torch.no_grad():
+                extra = {
+                    'x_prev_1': x_prev_1,
+                    'x_prev_2': x_prev_2,
+                    'case_params': case_params
+                }
+                result = self.model(x, t, extra)
 
-        # CFG interpolation: uncond + scale * (cond - uncond)
-        guided_output = uncond_output + self.cfg_scale * (cond_output - uncond_output)
+        self.nfe_counter += 1
+        return result.to(dtype=torch.float32)
 
-        return guided_output
-
-
-def collate_fn(batch):
-    x_prev_2 = torch.stack([item['x_prev_2'] for item in batch])
-    x_prev_1 = torch.stack([item['x_prev_1'] for item in batch])
-    x_target = torch.stack([item['x_target'] for item in batch])
-    
-    # Auto-detect: Get keys from first sample, use consistently
-    case_params_list = [item['case_params'] for item in batch]
-    param_keys = sorted(case_params_list[0].keys())  # Sort for consistency!
-    
-    # Convert to tensor with fixed key order
-    case_params_tensor = torch.tensor([
-        [float(params[key]) for key in param_keys]
-        for params in case_params_list
-    ])
-    
-    return {
-        'x_prev_2': x_prev_2[:, :2],      # Only velocity channels (u, v)
-        'x_prev_1': x_prev_1[:, :2],      # Only velocity channels (u, v)
-        'x_target': x_target[:, :2],      # Only velocity channels (u, v)
-        'mask': x_target[:, 2:3],         # Keep mask channel separate (shape: B, 1, H, W)
-        'case_params': case_params_tensor
-    }
 
 
 @torch.no_grad()
@@ -160,16 +133,24 @@ def generate_forecast(
     """
     model.eval()
 
-    wrapped_model = CFGModelWrapper(
-        model, x_prev_1, x_prev_2, case_params, cfg_scale=cfg_scale
-    )
-    solver = ODESolver(wrapped_model)
+    cfg_model = CFGScaledFluidModel(model)
+    cfg_model.eval()
+    solver = ODESolver(velocity_model=cfg_model)
 
     # Start from Gaussian noise
     x_0 = torch.randn_like(x_prev_1)
 
     # Solve ODE from t=0 to t=1
-    x_1 = solver.sample(x_0, step_size=1.0 / num_ode_steps)
+    x_1 = solver.sample(
+        x_init=x_0,
+        method='midpoint',
+        step_size=0.05,
+        cfg_scale=cfg_scale,
+        x_prev_1=x_prev_1,
+        x_prev_2=x_prev_2,
+        case_params=case_params,
+
+        )
 
     return x_1
 
@@ -194,9 +175,8 @@ def generate_multistep_forecast(
         num_steps: Number of future steps to predict
         device: Device
         num_ode_steps: Number of ODE integration steps per prediction
-        cfg_scale: Classifier-free guidance scale. 1.0 = no guidance,
-                   >1.0 amplifies conditioning, <1.0 weakens conditioning
-
+        cfg_scale: Classifier-free guidance scale. 
+                   
     Returns:
         predictions: List of predicted states, length num_steps, each (B, 2, H, W)
     """
@@ -263,7 +243,7 @@ def compute_metrics(predictions, ground_truth, mask=None):
 def visualize_forecast(initial_states, predictions, ground_truth, save_path, sample_idx=0):
     """
     Create visualization of forecast vs ground truth.
-    
+
     Args:
         initial_states: List of 2 initial states [x_{t-2}, x_{t-1}]
         predictions: List of T predicted states
@@ -272,72 +252,137 @@ def visualize_forecast(initial_states, predictions, ground_truth, save_path, sam
         sample_idx: Which sample in batch to visualize
     """
     num_steps = len(predictions)
-    fig, axes = plt.subplots(3, num_steps + 2, figsize=(3 * (num_steps + 2), 9))
-    
+
+    # Create figure with GridSpec for better colorbar control
+    from matplotlib.gridspec import GridSpec
+    fig = plt.figure(figsize=(3 * (num_steps + 2) + 1, 9))
+    gs = GridSpec(3, num_steps + 3, figure=fig, width_ratios=[1] * (num_steps + 2) + [0.05])
+
+    # Create axes for plots (excluding colorbar column)
+    axes = []
+    for row in range(3):
+        row_axes = []
+        for col in range(num_steps + 2):
+            ax = fig.add_subplot(gs[row, col])
+            row_axes.append(ax)
+        axes.append(row_axes)
+
+    # Collect all data to compute global min/max for consistent scales
+    all_u = []
+    all_v = []
+    all_mag = []
+
+    # Collect initial states
+    for state in initial_states:
+        u = state[sample_idx, 0].cpu().numpy()
+        v = state[sample_idx, 1].cpu().numpy()
+        all_u.append(u)
+        all_v.append(v)
+        all_mag.append(np.sqrt(u**2 + v**2))
+
+    # Collect predictions and ground truth
+    for t in range(num_steps):
+        pred = predictions[t][sample_idx].cpu().numpy()
+        gt = ground_truth[t][sample_idx].cpu().numpy()
+
+        all_u.extend([pred[0], gt[0]])
+        all_v.extend([pred[1], gt[1]])
+        all_mag.extend([
+            np.sqrt(pred[0]**2 + pred[1]**2),
+            np.sqrt(gt[0]**2 + gt[1]**2)
+        ])
+
+    # Compute global min/max
+    u_min, u_max = np.min([u.min() for u in all_u]), np.max([u.max() for u in all_u])
+    v_min, v_max = np.min([v.min() for v in all_v]), np.max([v.max() for v in all_v])
+    mag_min, mag_max = np.min([m.min() for m in all_mag]), np.max([m.max() for m in all_mag])
+
     # Plot initial states
     for i, state in enumerate(initial_states):
         u = state[sample_idx, 0].cpu().numpy()
         v = state[sample_idx, 1].cpu().numpy()
         magnitude = np.sqrt(u**2 + v**2)
-        
-        axes[0, i].imshow(u, cmap='RdBu_r')
-        axes[0, i].set_title(f't-{2-i}: u')
-        axes[0, i].axis('off')
-        
-        axes[1, i].imshow(v, cmap='RdBu_r')
-        axes[1, i].set_title(f't-{2-i}: v')
-        axes[1, i].axis('off')
-        
-        axes[2, i].imshow(magnitude, cmap='viridis')
-        axes[2, i].set_title(f't-{2-i}: |V|')
-        axes[2, i].axis('off')
-    
+
+        im_u = axes[0][i].imshow(u, cmap='RdBu_r', vmin=u_min, vmax=u_max)
+        axes[0][i].set_title(f't-{2-i}: u')
+        axes[0][i].axis('off')
+
+        im_v = axes[1][i].imshow(v, cmap='RdBu_r', vmin=v_min, vmax=v_max)
+        axes[1][i].set_title(f't-{2-i}: v')
+        axes[1][i].axis('off')
+
+        im_mag = axes[2][i].imshow(magnitude, cmap='viridis', vmin=mag_min, vmax=mag_max)
+        axes[2][i].set_title(f't-{2-i}: |V|')
+        axes[2][i].axis('off')
+
     # Plot predictions and ground truth
     for t in range(num_steps):
         pred = predictions[t][sample_idx].cpu().numpy()
         gt = ground_truth[t][sample_idx].cpu().numpy()
-        
+
         col = t + 2
-        
+
         # Prediction u
-        axes[0, col].imshow(pred[0], cmap='RdBu_r')
-        axes[0, col].set_title(f't+{t+1}: u (pred)')
-        axes[0, col].axis('off')
-        
-        # Prediction v
-        axes[1, col].imshow(pred[1], cmap='RdBu_r')
-        axes[1, col].set_title(f't+{t+1}: v (pred)')
-        axes[1, col].axis('off')
-        
-        # Magnitude with error overlay
+        axes[0][col].imshow(pred[0], cmap='RdBu_r', vmin=u_min, vmax=u_max)
+        axes[0][col].set_title(f't+{t+1}: u (pred)')
+        axes[0][col].axis('off')
+
+        # Ground Truth u
+        axes[1][col].imshow(gt[0], cmap='RdBu_r', vmin=u_min, vmax=u_max)
+        axes[1][col].set_title(f't+{t+1}: Ground Truth u')
+        axes[1][col].axis('off')
+
+        # Magnitude comparison (pred and gt side by side in same row)
         pred_mag = np.sqrt(pred[0]**2 + pred[1]**2)
         gt_mag = np.sqrt(gt[0]**2 + gt[1]**2)
-        error = np.abs(pred_mag - gt_mag)
-        
-        axes[2, col].imshow(pred_mag, cmap='viridis', alpha=0.7)
-        im = axes[2, col].imshow(error, cmap='Reds', alpha=0.5)
-        axes[2, col].set_title(f't+{t+1}: |V| + error')
-        axes[2, col].axis('off')
-    
+
+        axes[2][col].imshow(pred_mag, cmap='viridis', vmin=mag_min, vmax=mag_max)
+        axes[2][col].set_title(f't+{t+1}: |V| (pred)')
+        axes[2][col].axis('off')
+
+    # Add colorbars in the rightmost column
+    cbar_ax_u = fig.add_subplot(gs[0, -1])
+    cbar_u = plt.colorbar(im_u, cax=cbar_ax_u)
+    cbar_u.set_label('u velocity', rotation=270, labelpad=15)
+
+    cbar_ax_v = fig.add_subplot(gs[1, -1])
+    cbar_v = plt.colorbar(im_v, cax=cbar_ax_v)
+    cbar_v.set_label('v velocity', rotation=270, labelpad=15)
+
+    cbar_ax_mag = fig.add_subplot(gs[2, -1])
+    cbar_mag = plt.colorbar(im_mag, cax=cbar_ax_mag)
+    cbar_mag.set_label('|V|', rotation=270, labelpad=15)
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     logger.info(f"Saved visualization to {save_path}")
 
+def denormalize_velocity(velocity, stats):
+    """Function to denormalize values using training statistics"""
+    u_mean, u_std = stats['u_mean'], stats['u_std']
+    v_mean, v_std = stats['v_mean'], stats['v_std']
+    vel_mean = torch.stack([u_mean, v_mean]).reshape(1, -1, 1, 1).to(velocity.device)
+    vel_std = torch.stack([u_std, v_std]).reshape(1, -1, 1, 1).to(velocity.device)
+    
+    return velocity * vel_std + vel_mean
+   
+    
 
 def main():
     parser = argparse.ArgumentParser(description='Generate forecasts from trained model')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
+    parser.add_argument('--checkpoint', type=str, default='checkpoint.pth', help='Path to model checkpoint')
     parser.add_argument('--data_dir', type=str, default='../data', help='Data directory')
+    parser.add_argument('--data_name', type=str, required=True, help='problem name. Ex: cylinder_geo')
     parser.add_argument('--output_dir', type=str, default='./result', help='Output directory')
-    parser.add_argument('--num_forecast_steps', type=int, default=10, help='Number of steps to forecast')
+    parser.add_argument('--num_forecast_steps', type=int, default=1, help='Number of steps to forecast')
     parser.add_argument('--num_ode_steps', type=int, default=50, help='ODE solver steps')
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=10, help='Batch size')
     parser.add_argument('--num_samples', type=int, default=10, help='Number of samples to process')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
     parser.add_argument('--save_numpy', action='store_true', help='Save predictions as numpy arrays')
     parser.add_argument('--visualize', action='store_true', help='Create visualizations')
-    parser.add_argument('--cfg_scale', type=float, default=1.0,
+    parser.add_argument('--cfg_scale', type=float, default=0.3,
                         help='Classifier-free guidance scale. 1.0 = no guidance, '
                              '>1.0 amplifies conditioning, <1.0 weakens conditioning')
 
@@ -358,21 +403,30 @@ def main():
     data_dir = Path(args.data_dir)
     _, _, base_dataset_test = get_auto_dataset(
         data_dir=data_dir,
-        data_name='cylinder_geo',
+        data_name=args.data_name,
         delta_time=0.1,
         norm_props=True,
         norm_bc=True,
         load_splits=['test']
     )
+    # Get train stats to use same normalization for testing
+    stats_path = Path('./train_stats.pt')
+    train_stats = torch.load(stats_path, weights_only=False)
     
-    dataset_test = FlowCastWrapperDataset(base_dataset_test)
+    dataset_test = MultiStepFlowCastDataset(
+        base_dataset=base_dataset_test,
+        num_future_steps=args.num_forecast_steps,
+        normalize=True,
+        norm_stats=train_stats
+    )
+
     test_loader = DataLoader(
         dataset_test,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
-        collate_fn=collate_fn
+        collate_fn=multi_step_collate_fn
     )
     
     # Load model
@@ -381,14 +435,14 @@ def main():
     model = FluidDynamicsUNet(
         in_channels=2,
         out_channels=2,
-        model_channels=64,  # Updated to match new default
-        channel_mult=(1, 2, 4),  # Updated to match new default
-        num_res_blocks=1,  # Updated to match new default
-        attention_resolutions=(),  # No attention by default
-        dropout=0.2,  # Updated to match new default
+        model_channels=64,  
+        channel_mult=(1, 2, 4),  
+        num_res_blocks=2,  
+        attention_resolutions=(), 
+        dropout=0.2,  
         num_case_params=8,
         use_fourier_conditioning=True,
-        num_fourier_freqs=8,  # Updated to match new default
+        num_fourier_freqs=32,  # Updated to match new default
     ).to(device)
     
     checkpoint_path = Path(args.output_dir) / Path(args.checkpoint)
@@ -414,7 +468,10 @@ def main():
             # Move to device
             x_prev_2 = batch['x_prev_2'].to(device)
             x_prev_1 = batch['x_prev_1'].to(device)
+            ground_truth = batch['x_future']
             case_params = batch['case_params'].to(device)
+            # Print which case parameters are being used
+            print(f'case paramaters: {case_params}')
             mask = batch.get('mask', None)
             if mask is not None:
                 mask = mask.to(device)
@@ -430,8 +487,6 @@ def main():
                 cfg_scale=args.cfg_scale
             )
             
-            # For metrics, we need ground truth (requires accessing multiple future timesteps)
-            # This is a simplified version - you may need to modify based on your data structure
             
             # Save predictions
             if args.save_numpy:
@@ -442,18 +497,21 @@ def main():
             
             # Visualize
             if args.visualize and batch_idx < 5:  # Only visualize first 5 batches
-                # Create ground truth list (you'll need to implement this based on your data)
-                ground_truth = [batch['x_target'].cpu() for _ in range(args.num_forecast_steps)]
-                
+                # denormalize all data
+                x_prev_1_denorm = denormalize_velocity(x_prev_1, train_stats)
+                x_prev_2_denorm = denormalize_velocity(x_prev_2, train_stats)
+                predictions_denorm = [denormalize_velocity(pred, train_stats) for pred in predictions]
+                ground_truth_denorm = [denormalize_velocity(gt, train_stats) for gt in ground_truth]
+
                 visualize_forecast(
-                    [x_prev_2.cpu(), x_prev_1.cpu()],
-                    predictions,
-                    ground_truth,
+                    [x_prev_2_denorm.cpu(), x_prev_1_denorm.cpu()],
+                    predictions_denorm,
+                    ground_truth_denorm,
                     output_dir / f'forecast_batch_{batch_idx:04d}.png',
                     sample_idx=0
                 )
     
-    logger.info(f"Forecasts saved to {output_dir}")
+                logger.info(f"Forecasts saved to {output_dir}")
     
     # Save summary
     summary = {
